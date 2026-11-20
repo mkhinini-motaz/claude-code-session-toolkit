@@ -1,0 +1,297 @@
+#!/usr/bin/env python3
+"""Keep a project's narrative docs as one small file per topic, behind an index. Any project on this
+machine: its root is the outermost folder (below home) holding a CLAUDE.md, and each folder directly
+in it with its own CLAUDE.md is a repo. In each, CLAUDE.md holds rules, docs/notes/<topic>.md the
+narrative, and docs/architecture-notes.md indexes it (set NOTES_INDEXES=name.md,other.md to use other index names).
+
+  notes split <file.md>                        # every H1-H3 section of <file.md> (and every H4, else every bold
+                                       # bullet, of a section over 40 000 characters) becomes notes/<slug>.md beside
+                                       # it; <file.md> is left as the index linking to them
+  notes check <index.md> [orig.md] # every link resolves and every notes/ file is linked once; with
+                                       # orig.md, the index plus its notes still hold every line of it
+  notes check-all [--edit] [path]  # the doc limits, for the project around the current folder: its
+                                       # root and each repo (or only those holding the paths given): CLAUDE.md, each index and
+                                       # each note at most 40 000 bytes, an index holding only headings
+                                       # and links, every link resolving and no note orphaned. --edit
+                                       # skips the last two, which are false mid-edit (the hook after
+                                       # every Edit/Write uses it; the pre-commit hook and make test do not)
+  notes self-test                  # proves each limit fails when broken, on a scratch folder
+  notes install-hooks <project>    # a pre-commit hook in each repo running check-all on doc commits
+                                       # (skips a repo with its own hook: call check-all from that one)
+
+Why: a notes index that grows without limit ends up hundreds of thousands of characters long, with
+single paragraphs of 20k. A session looking for one decision then greps through all of it; with one
+file per topic it opens a 1-5k-token file. The limit exists because CLAUDE.md is loaded into every
+session and a note or an index is read whole.
+
+Re-running split on an index is safe: linked headings are left alone, and a section somebody pasted
+back in is split out again.
+"""
+import glob, os, re, subprocess, sys, unicodedata
+
+HOME = os.path.expanduser('~')
+INDEXES = tuple(os.environ.get('NOTES_INDEXES', 'architecture-notes.md').split(','))  # under docs/; the first is the default
+BIG = 40000    # a section over this is cut further by split
+LIMIT = 40000  # bytes, for CLAUDE.md, an index or a note; the post-commit hook warns at the same number
+NOTE = ('> **This file is an index** Each section lives in its own file under '
+        '[`notes/`](notes/): open only the one you need, or find it with `grep -ril <word> {notes}`. '
+        'New narrative goes in a new file there, linked from here under the right heading; never paste '
+        'narrative into this file. `~/.claude/bin/notes check-all` proves every link resolves.')
+HEADING = re.compile(r'^(#{1,3}) (.+)$')
+LINK = re.compile(r'\]\((notes/[^)]+\.md)\)')
+
+
+def headings(lines, depth=3):
+    """(line number, level, text) of each heading down to `depth`, outside code fences."""
+    fence = False
+    for i, line in enumerate(lines):
+        if line.startswith('```'):
+            fence = not fence
+        elif not fence and (m := re.match(r'^(#{1,%d}) (.+)$' % depth, line)):
+            yield i, len(m.group(1)), m.group(2)
+
+
+def first_split(lines):
+    """Where the sections start: the file's own H1 title and its intro are not a section."""
+    return next((i for i, lvl, _ in headings(lines) if not (i == 0 and lvl == 1)), len(lines))
+
+
+def slug(text, used):
+    t = re.sub(r'\([^)]*\b20\d\d\b[^)]*\)', '', text)
+    t = unicodedata.normalize('NFKD', re.sub(r'[`*_\[\]]', '', t).lower()).encode('ascii', 'ignore').decode()
+    t = re.sub(r'[^a-z0-9]+', '-', t).strip('-')
+    if len(t) > 60:
+        t = t[:60].rsplit('-', 1)[0]
+    base, n = t or 'section', 2
+    t = base
+    while t in used:
+        t, n = f'{base}-{n}', n + 1
+    used.add(t)
+    return t
+
+
+def esc(text):
+    return text.replace('[', r'\[').replace(']', r'\]')
+
+
+def split(path):
+    lines = open(path).read().split('\n')
+    notes = os.path.join(os.path.dirname(path), 'notes')
+    os.makedirs(notes, exist_ok=True)
+    used = {f[:-3] for f in os.listdir(notes) if f.endswith('.md')}
+    written = {}
+
+    def note(text, chunk):
+        name = f'notes/{slug(text, used)}.md'
+        while chunk and not chunk[-1].strip():
+            chunk = chunk[:-1]
+        written[name] = '\n'.join(chunk) + '\n'
+        return name
+
+    start = first_split(lines)
+    preamble = lines[:start]
+    while preamble and not preamble[-1].strip():
+        preamble.pop()
+    if not preamble:
+        title = os.path.basename(path)[:-3].replace('-', ' ').capitalize()
+        preamble = [f'# {title} — index']
+    out = list(preamble)
+    if not any(line.startswith(NOTE[:30]) for line in preamble):
+        out += ['', NOTE.format(notes=os.path.relpath(notes, os.path.dirname(os.path.dirname(notes))))]
+
+    bounds = [i for i, _, _ in headings(lines) if i >= start] + [len(lines)]
+    for a, b in zip(bounds, bounds[1:]):
+        head, body = lines[a], lines[a + 1:b]
+        lvl, text = HEADING.match(head).groups()
+        if len(lvl) <= 2:
+            out.append('')
+        if LINK.search(head) or all(LINK.search(line) or not line.strip() for line in body):
+            out += [head] + [line for line in body if line.strip()]
+            continue
+        parts = [(i, '#### ', t) for i, lvl, t in headings(body, 4) if lvl == 4]
+        if not parts:
+            for i, line in enumerate(body):
+                if line.startswith('- **'):
+                    m = re.match(r'- \*\*(.+?)\*\*\s*(\([^)]*\d{4}[^)]*\))?', line)
+                    bold = m.group(1) if m else line[4:84]
+                    parts.append((i, '- ', bold.rstrip('.: ') + (f' {m.group(2)}' if m and m.group(2) else '')))
+        if sum(map(len, body)) > BIG and parts:
+            out.append(head)
+            if ''.join(body[:parts[0][0]]).strip():
+                out.append(f'- [{esc(text)}: introduction]({note(text, body[:parts[0][0]])})')
+            for (x, mark, title), y in zip(parts, [p[0] for p in parts[1:]] + [len(body)]):
+                out.append(f'{mark}[{esc(title)}]({note(title, body[x:y])})')
+            continue
+        out.append(f'{lvl} [{esc(text)}]({note(text, lines[a:b])})')
+
+    for name, body in written.items():
+        open(os.path.join(os.path.dirname(path), name), 'w').write(body)
+    open(path, 'w').write('\n'.join(out) + '\n')
+    print(f'{path}: {len(written)} notes written, index {len(chr(10).join(out))} characters')
+
+
+def check(path, orig=None):
+    base = os.path.dirname(path)
+    lines = open(path, errors='replace').read().split('\n')
+    links = [m.group(1) for line in lines for m in LINK.finditer(line)]
+    problems = [f'broken link {l}' for l in links if not os.path.isfile(os.path.join(base, l))]
+    problems += [f'{l} linked {links.count(l)} times' for l in sorted(set(links)) if links.count(l) > 1]
+    notes = os.path.join(base, 'notes')
+    on_disk = {f'notes/{f}' for f in os.listdir(notes) if f.endswith('.md')} if os.path.isdir(notes) else set()
+    problems += [f'{f} is linked from nowhere' for f in sorted(on_disk - set(links))]
+    if orig:
+        kept = []
+        for line in lines[first_split(lines):]:
+            m = LINK.search(line)
+            kept += open(os.path.join(base, m.group(1)), errors='replace').read().split('\n') if m else [line]
+        want = open(orig, errors='replace').read().split('\n')
+        want = [l for l in want[first_split(want):] if l.strip()]
+        kept = [l for l in kept if l.strip()]
+        if kept != want:
+            i = next((i for i, (k, w) in enumerate(zip(kept, want)) if k != w), min(len(kept), len(want)))
+            problems.append(f'differs from {orig} at its non-blank line {i}: '
+                            f'{(want[i:i+1] or ["<end>"])[0][:80]!r} vs {(kept[i:i+1] or ["<end>"])[0][:80]!r}')
+    for p in problems:
+        print(f'{path}: {p}')
+    if not problems and orig:
+        print(f'{path}: ok, {len(links)} notes, every line of {orig} kept')
+    return not problems
+
+
+def project_root(path, stop=HOME):
+    """The outermost folder above `path`, below `stop`, holding a CLAUDE.md; None outside a project."""
+    d, root = os.path.abspath(path if os.path.isdir(path) else os.path.dirname(path)), None
+    while d.startswith(stop + os.sep):
+        if os.path.isfile(os.path.join(d, 'CLAUDE.md')):
+            root = d
+        d = os.path.dirname(d)
+    return root
+
+
+def scopes(root):
+    """The project root, then each folder directly in it that has its own CLAUDE.md."""
+    return [root] + sorted(os.path.join(root, d) for d in os.listdir(root)
+                           if not d.startswith('.') and os.path.isfile(os.path.join(root, d, 'CLAUDE.md')))
+
+
+def scope_of(path, root):
+    top = os.path.join(root, os.path.relpath(os.path.abspath(path), root).split(os.sep)[0])
+    return top if top in scopes(root)[1:] else root
+
+
+def limits(base, root, edit=False):
+    """One scope's doc limits; prints each problem with what to do about it."""
+    index = next((os.path.join(base, 'docs', i) for i in INDEXES if os.path.isfile(os.path.join(base, 'docs', i))),
+                 os.path.join(base, 'docs', INDEXES[0]))
+    notes = sorted(glob.glob(os.path.join(base, 'docs', 'notes', '*.md')))
+    problems = []
+    for f in [os.path.join(base, 'CLAUDE.md'), index] + notes:
+        if os.path.isfile(f) and (n := os.path.getsize(f)) > LIMIT:
+            fix = ('it is loaded into every session: move narrative into a new note under docs/notes/ '
+                   'with a line in the index, and keep the rule here to a line or two') if f.endswith('CLAUDE.md') \
+                else 'it is read whole: cut it into two topic notes, each linked from the index'
+            problems.append(f'{os.path.relpath(f, root)} is {n} bytes, over the {LIMIT} limit; {fix}')
+    if os.path.isfile(index):
+        lines = open(index, errors='replace').read().split('\n')
+        start = first_split(lines)
+        for i, line in enumerate(lines[start:], start + 1):
+            if line.strip() and not re.match(r'#{1,6} ', line) and not (line.startswith('- [') and LINK.search(line)):
+                problems.append(f'{os.path.relpath(index, root)} line {i} is narrative, and an index holds only '
+                                f'headings and links: `~/.claude/bin/notes split {index}` '
+                                f'moves it into a note')
+                break
+    for p in problems:
+        print(p)
+    ok = not problems
+    if os.path.isfile(index) and not edit:
+        ok = check(index) and ok
+    if ok:
+        print(f'{os.path.basename(root)} (root): ok' if base == root else f'{os.path.relpath(base, root)}: ok')
+    return ok
+
+
+def hooks_dir(repo):
+    """The repo's hooks folder; --git-path follows worktrees (.git is a file) and core.hooksPath."""
+    out = subprocess.run(['git', '-C', repo, 'rev-parse', '--git-path', 'hooks'], capture_output=True, text=True).stdout.strip()
+    return os.path.join(repo, out or '.git/hooks')
+
+
+def self_test():
+    import contextlib, io, shutil, tempfile
+    top = tempfile.mkdtemp()
+    tmp = os.path.join(top, 'project')
+    put = lambda rel, text: (os.makedirs(os.path.dirname(os.path.join(tmp, rel)), exist_ok=True),
+                             open(os.path.join(tmp, rel), 'w').write(text))
+    repo = os.path.join(tmp, 'repo')
+    def passes(edit=False):
+        with contextlib.redirect_stdout(io.StringIO()):
+            return limits(repo, tmp, edit)
+    index = '# Repo notes\n\nIntro.\n\n## Area\n- [One](notes/one.md)\n'
+    clean = lambda: (put('CLAUDE.md', 'rules\n'), put('repo/CLAUDE.md', 'rules\n'), put('repo/docs/architecture-notes.md', index),
+                     put('repo/docs/notes/one.md', '# One\n'),
+                     [os.remove(f) for f in glob.glob(os.path.join(repo, 'docs/notes/*.md')) if not f.endswith('one.md')])
+    cases = []
+    def case(name, setup, full, edit):
+        clean()
+        setup()
+        cases.append((name, passes() == full and passes(True) == edit))
+    case('a clean repo passes', lambda: None, True, True)
+    case('CLAUDE.md over the limit fails', lambda: put('repo/CLAUDE.md', 'x' * (LIMIT + 1)), False, False)
+    case('a note over the limit fails', lambda: put('repo/docs/notes/one.md', 'x' * (LIMIT + 1)), False, False)
+    case('narrative in an index fails', lambda: put('repo/docs/architecture-notes.md', index + 'A paragraph.\n'), False, False)
+    case('an orphaned note fails, except mid-edit', lambda: put('repo/docs/notes/two.md', '# Two\n'), False, True)
+    case('a broken link fails, except mid-edit',
+         lambda: put('repo/docs/architecture-notes.md', index + '- [Gone](notes/gone.md)\n'), False, True)
+    clean()
+    note = os.path.join(repo, 'docs', 'notes', 'one.md')
+    cases.append(('the project is the outermost folder with a CLAUDE.md, a repo is a folder in it with one',
+                  project_root(note, stop=top) == tmp and scopes(tmp) == [tmp, repo] and scope_of(note, tmp) == repo
+                  and scope_of(os.path.join(tmp, 'CLAUDE.md'), tmp) == tmp and project_root(top, stop=top) is None))
+    subprocess.run(['git', 'init', '-q', repo], check=True)
+    subprocess.run(['git', '-C', repo, 'config', 'core.hooksPath', 'myhooks'], check=True)
+    os.makedirs(os.path.join(repo, 'myhooks'))
+    cases.append(('install-hooks finds a core.hooksPath folder', hooks_dir(repo) == os.path.join(repo, 'myhooks')))
+    shutil.rmtree(top)
+    for name, ok in cases:
+        print(('✓ ' if ok else '✗ ') + name)
+    return all(ok for _, ok in cases)
+
+
+if __name__ == '__main__':
+    cmd, args = (sys.argv[1:2] or [''])[0], sys.argv[2:]
+    if cmd == 'split' and len(args) == 1:
+        split(args[0])
+    elif cmd == 'check' and len(args) in (1, 2):
+        sys.exit(0 if check(*args) else 1)
+    elif cmd == 'self-test':
+        sys.exit(0 if self_test() else 1)
+    elif cmd == 'check-all':
+        edit = '--edit' in args
+        paths = [a for a in args if a != '--edit']
+        if paths:
+            todo = sorted({(scope_of(p, r), r) for p in paths if (r := project_root(p))})
+        else:
+            r = project_root(os.getcwd()) or sys.exit(f'{os.getcwd()} is in no project: no CLAUDE.md above it')
+            todo = [(s, r) for s in scopes(r)]
+        sys.exit(0 if all([limits(s, r, edit) for s, r in todo]) else 1)
+    elif cmd == 'install-hooks' and len(args) == 1:
+        root, me = os.path.abspath(args[0]), os.path.abspath(__file__)
+        for s in scopes(root):
+            hooks = hooks_dir(s)
+            if not os.path.isdir(hooks):
+                continue
+            hook = os.path.join(hooks, 'pre-commit')
+            if os.path.isfile(hook) and '# docs-limits' not in open(hook).read():
+                print(f'skip {s}: it has its own pre-commit hook; call `{me} check-all "$(git rev-parse --show-toplevel)"` '
+                      f'from it for commits touching CLAUDE.md or docs/')
+                continue
+            open(hook, 'w').write(
+                '#!/bin/sh\n# docs-limits: written by ~/.claude/bin/notes install-hooks. Blocks a doc commit that leaves a\n'
+                '# CLAUDE.md, an index or a note over 40 000 bytes, narrative in an index, a broken link or an orphaned\n'
+                '# note. Move the text; never --no-verify past it.\n'
+                "git diff --cached --name-only | grep -qE '(^|/)CLAUDE\\.md$|^docs/' || exit 0\n"
+                f'exec "{me}" check-all "$(git rev-parse --show-toplevel)"\n')
+            os.chmod(hook, 0o755)
+            print(f'installed {s}')
+    else:
+        sys.exit(__doc__)

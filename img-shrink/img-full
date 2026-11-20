@@ -1,0 +1,9 @@
+#!/bin/sh
+# img-full <image>: prints a path to a full-size copy that the img-shrink hook leaves alone; Read that path.
+# The copy is an APFS clone (cp -c, no extra space): its own inode, so nothing can reach the original. Until 21 Nov 2026
+# it was a hard link, and two same-named images in one second made `cp` write the second into the first original.
+[ -f "$1" ] || { echo "img-full: no such file: $1" >&2; exit 1; }
+d="/private/tmp/claude-$(id -u)/img/full"; mkdir -p "$d"
+o="$d/$(date +%s)-$$-$(basename "$1")"
+cp -c "$1" "$o" 2>/dev/null || cp "$1" "$o" || exit 1
+echo "$o"

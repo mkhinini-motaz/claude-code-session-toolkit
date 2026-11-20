@@ -1,0 +1,79 @@
+#!/bin/sh
+# bg start <name> [--cwd dir] -- <cmd...> | bg ls | bg stop <name>|--all | bg --self-test
+# Background processes the safe way: PID from $! in <scratchpad>/<name>.pid, output in <name>.log, so
+# a session-end step can stop them by name. Scratchpad: BG_DIR, else /private/tmp/claude-<uid>/*/$CLAUDE_CODE_SESSION_ID/scratchpad.
+# stop kills the PID and its children. Processes whose command contains a BG_KEEP entry are skipped
+# (BG_KEEP is a ':'-separated list of substrings; default mysqld:redis-server).
+set -u
+if [ -n "${BG_DIR:-}" ]; then D=$BG_DIR
+else
+  D=$(ls -d /private/tmp/claude-"$(id -u)"/*/"${CLAUDE_CODE_SESSION_ID:-none}"/scratchpad 2>/dev/null | head -1)
+fi
+tree() { for c in $(pgrep -P "$1"); do tree "$c"; done; echo "$1"; }
+stop() {
+  f=$D/$1.pid; [ -f "$f" ] || { echo "$1: no such name"; return 1; }
+  p=$(tr -d ' \n' < "$f")
+  case $p in ''|*[!0-9]*) echo "$1: no PID in file"; rm -f "$f"; return;; esac
+  cmd=$(ps -o command= -p "$p" 2>/dev/null)
+  [ -n "$cmd" ] || { echo "$1 ($p): already gone"; rm -f "$f"; return; }
+  [ -f "$D/$1.start" ] || { echo "$1 ($p): no start time recorded (older pid file), not stopped: check PID $p, then stop it yourself and delete $f"; return 1; }
+  if [ "$(ps -o lstart= -p "$p" 2>/dev/null)" != "$(cat "$D/$1.start")" ]; then
+    echo "$1 ($p): that PID now belongs to another process, not stopped"; rm -f "$f" "$D/$1.start"; return
+  fi
+  keep=${BG_KEEP-mysqld:redis-server}; oldifs=$IFS; IFS=:
+  for k in $keep; do
+    case $cmd in *"$k"*) IFS=$oldifs; echo "$1 ($p): skipped, shared process: $(echo "$cmd" | cut -c1-80)"; return;; esac
+  done
+  IFS=$oldifs
+  kill $(tree "$p") 2>/dev/null && echo "$1 ($p): stopped"
+  rm -f "$f" "$D/$1.start"
+}
+if [ "${1:-}" = --self-test ]; then
+  T=$(mktemp -d); export BG_DIR=$T; fail=0
+  "$0" start t1 -- sh -c 'sleep 300 & wait' >/dev/null || fail=1
+  sleep 1; p=$(cat "$T/t1.pid"); kid=$(pgrep -P "$p")
+  "$0" ls | grep -q 't1.*yes' || { echo "FAIL: ls"; fail=1; }
+  [ -f "$T/t1.log" ] || { echo "FAIL: no log"; fail=1; }
+  "$0" stop t1 >/dev/null; sleep 1
+  kill -0 "$p" 2>/dev/null && { echo "FAIL: parent runs"; fail=1; }
+  [ -n "$kid" ] && kill -0 "$kid" 2>/dev/null && { echo "FAIL: child runs"; fail=1; }
+  [ -f "$T/t1.pid" ] && { echo "FAIL: pid file stays"; fail=1; }
+  "$0" start k -- sh -c 'sleep 30; echo' keepme >/dev/null
+  BG_KEEP=keepme "$0" stop k | grep -q skipped || { echo "FAIL: BG_KEEP"; fail=1; }
+  BG_KEEP= "$0" stop k | grep -q stopped || { echo "FAIL: stop after keep"; fail=1; }
+  "$0" start r -- sleep 30 >/dev/null; rp=$(cat "$T/r.pid"); echo "Thu Jan  1 00:00:00 1970" > "$T/r.start"  # as if the PID were reused
+  "$0" stop r | grep -q 'another process' && kill -0 "$rp" 2>/dev/null || { echo "FAIL: reused PID"; fail=1; }
+  "$0" start r -- sleep 30 | grep -q 'already runs' && { echo "FAIL: a reused PID blocks start"; fail=1; }
+  kill "$rp" "$(cat "$T/r.pid")" 2>/dev/null
+  sleep 30 & op=$!; echo $op > "$T/o.pid"  # a pid file with no .start file, as written by an older bg
+  "$0" stop o | grep -q 'no start time' && kill -0 "$op" 2>/dev/null || { echo "FAIL: legacy pid file was stopped"; fail=1; }
+  kill "$op" 2>/dev/null; wait "$op" 2>/dev/null
+  rm -rf "$T"; [ $fail = 0 ] && echo "self-test ok"; exit $fail
+fi
+[ -d "$D" ] || { echo "bg: no scratchpad: set CLAUDE_CODE_SESSION_ID or BG_DIR" >&2; exit 2; }
+case ${1:-} in
+  start)
+    n=${2:?usage: bg start <name> [--cwd dir] -- <cmd...>}; shift 2; cwd=.
+    [ "${1:-}" = --cwd ] && { cwd=$2; shift 2; }
+    [ "${1:-}" = -- ] && shift; [ $# -gt 0 ] || { echo "bg: no command" >&2; exit 2; }
+    case $n in */*|'') echo "bg: bad name" >&2; exit 2;; esac
+    op=$(cat "$D/$n.pid" 2>/dev/null)  # runs only if the PID is alive and still the process that was started
+    if [ -n "$op" ] && kill -0 "$op" 2>/dev/null && [ "$(ps -o lstart= -p "$op" 2>/dev/null)" = "$(cat "$D/$n.start" 2>/dev/null)" ]; then echo "bg: $n already runs" >&2; exit 1; fi
+    cd "$cwd" || exit 2
+    nohup "$@" > "$D/$n.log" 2>&1 < /dev/null & echo $! > "$D/$n.pid"
+    ps -o lstart= -p "$(cat "$D/$n.pid")" > "$D/$n.start" 2>/dev/null  # stop checks it, so a reused PID is never killed
+    echo "$n: PID $(cat "$D/$n.pid"), log $D/$n.log";;
+  ls)
+    printf '%-16s %-7s %-6s %-9s %s\n' NAME PID ALIVE AGE LOG
+    for f in "$D"/*.pid; do [ -f "$f" ] || continue
+      n=$(basename "$f" .pid); p=$(cat "$f"); a=no; kill -0 "$p" 2>/dev/null && a=yes
+      printf '%-16s %-7s %-6s %-9s %s\n' "$n" "$p" "$a" "$(ps -o etime= -p "$p" 2>/dev/null | tr -d ' ' || true)" "$D/$n.log"
+    done;;
+  stop)
+    case ${2:-} in
+      --all) for f in "$D"/*.pid; do [ -f "$f" ] && stop "$(basename "$f" .pid)"; done; true;;
+      '') echo "usage: bg stop <name>|--all" >&2; exit 2;;
+      *) stop "$2";;
+    esac;;
+  *) echo "usage: bg start <name> [--cwd dir] -- <cmd...> | ls | stop <name>|--all" >&2; exit 2;;
+esac

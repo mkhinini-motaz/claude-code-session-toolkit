@@ -1,0 +1,15 @@
+{
+  "name": "session-tools",
+  "description": "Small tools and skills from a daily Claude Code setup.",
+  "owner": {
+    "name": "mkhinini-motaz",
+    "url": "https://github.com/mkhinini-motaz"
+  },
+  "plugins": [
+    {
+      "name": "session-toolkit",
+      "source": "./",
+      "description": "Claude Code session tools: four skills (code audit, harness audit, Notion task pages, plain prose) and a worker agent. The other CLI tools and hooks install with install.sh."
+    }
+  ]
+}

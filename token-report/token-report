@@ -1,0 +1,463 @@
+#!/usr/bin/env python3
+"""Where Claude Code's tokens go, read from the session transcripts under ~/.claude/projects.
+
+  token-report [--days N] [path]   # one project's last N days (default 14) of sessions: the main thread
+                                   # against subagents, by model; how big the context was when the tokens
+                                   # were spent; the costliest sessions; each subagent type; and which tools
+                                   # fill the main context; call counts of tools, skills and subagents.
+                                   # path is the project folder (default: the
+                                   # current one) or a transcripts folder itself
+  token-report skills [--days N]   # every installed skill (user, enabled plugins, current project) with its
+                                   # description size and how often it was invoked over N days (default 30)
+                                   # across all projects: the never-used ones are what to switch off
+  token-report repos [--days N]    # input and output tokens per project folder and per day (default 14 days),
+                                   # main thread and subagents together
+  token-report hook [--over K]     # UserPromptSubmit hook: tells Claude the context size on every prompt,
+                                   # and past K thousand tokens (default 300) to keep its state file current
+                                   # before auto-compaction. Never blocks: it only prints
+  token-report self-test           # proves the counting on a scratch transcript
+
+Input tokens here are everything a call reads: fresh input plus cache reads and cache writes. Cache
+reads are billed at a fraction of fresh input, but they still cost usage, time and model attention.
+"""
+import collections, glob, json, os, re, statistics, sys, tempfile, time
+
+PROJECTS = os.path.expanduser('~/.claude/projects')
+STATE = os.path.expanduser('~/.claude/state')
+WEIGHT = {'in': 1, 'cw': 1.25, 'cr': 0.1, 'out': 5}  # relative price of each token class: ordering only, never money
+
+
+def calls(path):
+    """(model, context, output) once per API call."""
+    for model, ctx, out, _ in calls_ts(path):
+        yield model, ctx, out
+
+
+def calls_ts(path):
+    """(model, context, output, timestamp) once per API call. A call writes one line per content block,
+    each repeating the same usage, so lines are counted once per message id."""
+    seen = set()
+    with open(path, errors='replace') as f:
+        for line in f:
+            try:
+                d = json.loads(line)
+            except ValueError:
+                continue
+            m = d.get('message') or {}
+            u = m.get('usage')
+            if d.get('type') != 'assistant' or not u or m.get('id') in seen:
+                continue
+            seen.add(m.get('id'))
+            ctx = u.get('input_tokens', 0) + u.get('cache_read_input_tokens', 0) + u.get('cache_creation_input_tokens', 0)
+            if ctx:
+                yield m.get('model', '?'), ctx, u.get('output_tokens', 0), d.get('timestamp', '')
+
+
+def tool_results(path):
+    """(tool name, text characters, images) for each tool result in a transcript."""
+    names = {}
+    with open(path, errors='replace') as f:
+        for line in f:
+            try:
+                d = json.loads(line)
+            except ValueError:
+                continue
+            content = (d.get('message') or {}).get('content')
+            if not isinstance(content, list):
+                continue
+            for b in content:
+                if not isinstance(b, dict):
+                    continue
+                if b.get('type') == 'tool_use':
+                    n = b.get('name', '?')
+                    names[b.get('id')] = 'mcp:' + n.split('__')[1] if n.startswith('mcp__') else n
+                elif b.get('type') == 'tool_result':
+                    c = b.get('content')
+                    blocks = c if isinstance(c, list) else [{'type': 'text', 'text': str(c or '')}]
+                    text = sum(len(x.get('text', '')) for x in blocks if isinstance(x, dict) and x.get('type') == 'text')
+                    imgs = sum(1 for x in blocks if isinstance(x, dict) and x.get('type') == 'image')
+                    yield names.get(b.get('tool_use_id'), '?'), text, imgs
+
+
+def usage(path):
+    """(kind, name) for each tool call ('tool'), Skill call or typed /command ('skill') and Agent call
+    ('agent') in a transcript. MCP tools are grouped by server."""
+    seen = set()
+    with open(path, errors='replace') as f:
+        for line in f:
+            if 'tool_use' not in line and '<command-name>' not in line:
+                continue
+            try:
+                d = json.loads(line)
+            except ValueError:
+                continue
+            content = (d.get('message') or {}).get('content')
+            if d.get('type') == 'user':
+                text = content if isinstance(content, str) else ' '.join(
+                    b.get('text', '') for b in content or [] if isinstance(b, dict))
+                for c in re.findall(r'<command-name>/?([^<\s]+)</command-name>', text):
+                    yield 'skill', c
+            if not isinstance(content, list):
+                continue
+            for b in content:
+                if not isinstance(b, dict) or b.get('type') != 'tool_use' or b.get('id') in seen:
+                    continue
+                seen.add(b.get('id'))
+                n, i = b.get('name', '?'), b.get('input') or {}
+                yield 'tool', f'mcp__{n.split("__")[1]}__*' if n.startswith('mcp__') else n
+                if n == 'Skill' and i.get('skill'):
+                    yield 'skill', i['skill'].lstrip('/')
+                elif n in ('Agent', 'Task'):
+                    yield 'agent', i.get('subagent_type') or 'general-purpose'
+
+
+def collect(folder, days):
+    cut = time.time() - days * 86400
+    s = {'by': collections.defaultdict(collections.Counter), 'bucket': collections.Counter(),
+         'sessions': [], 'agents': collections.defaultdict(list), 'tools': collections.defaultdict(collections.Counter),
+         'use': collections.defaultdict(collections.Counter)}
+    for f in glob.glob(os.path.join(folder, '*.jsonl')):
+        if os.path.getmtime(f) < cut:
+            continue
+        sid = os.path.basename(f)[:-6]
+        main = list(calls(f))
+        sub_total = sub_calls = 0
+        for mf, ctx, out in main:
+            k = s['by'][('main', mf)]
+            k['calls'] += 1; k['in'] += ctx; k['out'] += out
+            s['bucket'][min(ctx // 200_000, 4)] += ctx
+        for name, text, imgs in tool_results(f):
+            t = s['tools'][name]
+            t['n'] += 1; t['chars'] += text; t['images'] += imgs
+        for kind, name in usage(f):
+            s['use'][kind][name] += 1
+        for af in glob.glob(os.path.join(folder, sid, 'subagents', '*.jsonl')):
+            for kind, name in usage(af):
+                s['use'][kind][name] += 1
+            try:
+                kind = json.load(open(af[:-6] + '.meta.json')).get('agentType', '?')
+            except (OSError, ValueError):
+                kind = '?'
+            sub = list(calls(af))
+            if not sub:
+                continue
+            for mf, ctx, out in sub:
+                k = s['by'][('sub', mf)]
+                k['calls'] += 1; k['in'] += ctx; k['out'] += out
+            tokens = sum(c for _, c, _ in sub)
+            sub_total += tokens; sub_calls += len(sub)
+            s['agents'][kind].append((len(sub), tokens, sub[0][1], sub[-1][1]))
+        if main:
+            s['sessions'].append((sid[:8], len(main), sub_calls, sum(c for _, c, _ in main), sub_total,
+                                  main[0][1], max(c for _, c, _ in main)))
+    return s
+
+
+def report(s, days):
+    M = lambda n: f'{n / 1e6:,.1f}M'
+    total = sum(k['in'] for k in s['by'].values())
+    if not total:
+        print(f'No sessions in the last {days} days.')
+        return
+    print(f'{len(s["sessions"])} sessions, last {days} days: {M(total)} input tokens\n')
+    print('Thread and model                         calls      input    output   share')
+    for (thread, model), k in sorted(s['by'].items(), key=lambda x: -x[1]['in']):
+        print(f'  {thread:5} {model:32} {k["calls"]:7,} {M(k["in"]):>10} {M(k["out"]):>9} {100 * k["in"] / total:6.1f}%')
+    main_total = sum(s['bucket'].values())
+    print('\nMain-thread input by context size when spent')
+    for b in sorted(s['bucket']):
+        label = f'{b * 200}-{b * 200 + 200}k' if b < 4 else '800k+'
+        print(f'  {label:10} {100 * s["bucket"][b] / main_total:5.1f}%')
+    starts = [x[5] for x in s['sessions']]
+    print(f'\nStarting context (main): median {statistics.median(starts) // 1000}k, '
+          f'min {min(starts) // 1000}k, max {max(starts) // 1000}k')
+    print('\nCostliest sessions        calls  sub-calls  main in   sub in   peak')
+    for sid, mc, sc, mi, si, _, peak in sorted(s['sessions'], key=lambda x: -(x[3] + x[4]))[:8]:
+        print(f'  {sid}             {mc:6,} {sc:9,} {M(mi):>9} {M(si):>8} {peak // 1000:5}k')
+    if s['agents']:
+        print('\nSubagent type              runs   total  median/run  calls  start    end')
+        for kind, runs in sorted(s['agents'].items(), key=lambda x: -sum(r[1] for r in x[1])):
+            med = sorted(runs, key=lambda r: r[1])[len(runs) // 2]
+            print(f'  {kind[:24]:24} {len(runs):5} {M(sum(r[1] for r in runs)):>7} {M(med[1]):>11} '
+                  f'{med[0]:6} {med[2] // 1000:5}k {med[3] // 1000:5}k')
+    print('\nTool results entering the main context (text ~4 chars per token)')
+    for name, t in sorted(s['tools'].items(), key=lambda x: -x[1]['chars'])[:10]:
+        imgs = f', {t["images"]:,} images' if t['images'] else ''
+        print(f'  {name[:28]:28} {t["chars"] / 4e6:6.1f}M tokens in {t["n"]:,} results{imgs}')
+    for kind, title in (('tool', 'Tool calls (main thread and subagents, MCP by server)'),
+                        ('skill', 'Skills and typed slash commands'), ('agent', 'Agent calls by subagent type')):
+        if s['use'][kind]:
+            print(f'\n{title}')
+            for name, n in s['use'][kind].most_common(15):
+                print(f'  {name[:36]:36} {n:6,}')
+
+
+def last_context(path):
+    """The context size of the transcript's last API call, read from its tail only."""
+    with open(path, 'rb') as f:
+        f.seek(max(0, os.path.getsize(path) - 2_000_000))
+        lines = f.read().decode(errors='replace').splitlines()
+    for line in reversed(lines):
+        try:
+            d = json.loads(line)
+        except ValueError:
+            continue
+        u = (d.get('message') or {}).get('usage')
+        if d.get('type') == 'assistant' and u:
+            ctx = u.get('input_tokens', 0) + u.get('cache_read_input_tokens', 0) + u.get('cache_creation_input_tokens', 0)
+            if ctx:
+                return ctx
+    return 0
+
+
+# Costly habits the hook nudges about: a huge paste, a key pasted into chat, "do all" with no budget, and
+# long sessions that change topic.
+SECRET_SHAPES = re.compile(
+    r'AIza[0-9A-Za-z_-]{35}|AKIA[0-9A-Z]{16}|sk-[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9]{30,}|xox[baprs]-[A-Za-z0-9-]{10,}'
+    r'|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}|-----BEGIN [A-Z ]*PRIVATE KEY-----'
+    r'|AGE-SECRET-KEY-1[0-9A-Z]{20,}|gcr_[0-9A-Za-z_-]{43}|apify_api_[A-Za-z0-9]{20,}')
+BROAD = re.compile(r'\b(do|fix|implement|build|apply|finish|close)\s+(it\s+)?(all|every\s?thing)\b|\ball of (it|them|what)\b', re.I)
+
+
+def retention_days():
+    """Days Claude Code keeps transcripts: cleanupPeriodDays from settings.json, default 30."""
+    try:
+        d = json.load(open(os.path.expanduser('~/.claude/settings.json'))).get('cleanupPeriodDays', 30)
+        return d if isinstance(d, int) and d > 0 else 30
+    except (OSError, ValueError, AttributeError):
+        return 30
+
+
+def advice(prompt, ctx, topic=True):
+    """One-line nudges, each only when its habit shows in this prompt. Never blocks."""
+    notes, size = [], len(prompt.encode())
+    if size > 30_000:
+        notes.append(f'This prompt carries a {size // 1000} KB paste (about {size // 4000}k tokens) that every call re-reads: '
+                     'save it to a scratchpad file and work from the file; tell the user once that `! pbpaste > <file>`, '
+                     'then "read <file>", costs almost nothing.')
+    if SECRET_SHAPES.search(prompt):
+        notes.append('The prompt holds a key- or token-shaped string: tell the user once, plainly, that it now sits in the '
+                     f'transcripts under ~/.claude/projects for {retention_days()} days, and that `! pbpaste > <file>` or the password '
+                     'manager keeps it out next time. Never repeat the value.')
+    if BROAD.search(prompt):
+        notes.append('Broad request: before fanning out 3+ agents or sweeping 3+ repos, give one line with the estimated '
+                     'cost (agents x the median run in `token-report`) and a smaller first slice; past 5 agents or 3 '
+                     'repos, wait for a go-ahead.')
+    if ctx >= 150_000 and topic:
+        notes.append(f'Context {ctx // 1000}k: if this prompt starts a topic unrelated to the session so far, suggest '
+                     'a fresh session in one line, unless you already did in this session.')
+    return notes
+
+
+def hook(over):
+    try:
+        p = json.load(sys.stdin)
+    except ValueError:
+        return
+    if not isinstance(p, dict):
+        return
+    try:
+        ctx = last_context(p['transcript_path'])
+    except (OSError, KeyError, TypeError):  # first prompt: no transcript yet, the nudges still apply
+        ctx = 0
+    # the topic nudge fires once per session: a marker file per session id (state dir, else the temp dir)
+    sid = p.get('session_id') or ''
+    marker = os.path.join(STATE, f'topic-nudge-{re.sub(r"[^A-Za-z0-9-]", "", sid)}') if sid else ''
+    notes = advice(p.get('prompt') or '', ctx, topic=not (marker and os.path.exists(marker)))
+    if marker and any('unrelated' in n for n in notes):
+        try:
+            os.makedirs(STATE, exist_ok=True)
+            open(marker, 'w').close()
+        except OSError:
+            pass
+    tips = ' '.join(notes)
+    if not ctx:
+        if tips:
+            print(tips)
+        return
+    st = ''
+    if ctx >= over * 1000:
+        slug = os.path.basename(os.path.dirname(p['transcript_path']))
+        sid = p.get('session_id', '')
+        hits = glob.glob(f'/private/tmp/claude-*/*/{sid}/scratchpad/[sS][tT][aA][tT][eE].md')
+        st = (f' State file last written {int((time.time() - max(map(os.path.getmtime, hits))) // 60)} min ago.' if hits else
+              f' No state file yet: write /private/tmp/claude-{os.getuid()}/{slug}/{sid}/scratchpad/state.md')
+    note = (' Auto-compaction is near: keep the scratchpad state file (done, decisions, next, files touched) '
+            'current so it loses nothing.' + st) if ctx >= over * 1000 else ''
+    print(f'Context: {ctx // 1000}k tokens.{note}' + (f' {tips}' if tips else ''))
+
+
+def transcripts(days):
+    """(project folder name, transcript path) for every main and subagent transcript touched in the window."""
+    cut = time.time() - days * 86400
+    for proj in sorted(glob.glob(os.path.join(PROJECTS, '*'))):
+        for f in glob.glob(os.path.join(proj, '*.jsonl')) + glob.glob(os.path.join(proj, '*', 'subagents', '*.jsonl')):
+            if os.path.getmtime(f) >= cut:
+                yield os.path.basename(proj), f
+
+
+def frontmatter(path):
+    """(name, description) from a SKILL.md header. Handles plain, quoted and > or | block values."""
+    try:
+        head = open(path, errors='replace').read().split('---')[1]
+    except (OSError, IndexError):
+        return None, ''
+    out, key = {}, None
+    for ln in head.splitlines():
+        m = re.match(r'(\w[\w-]*):\s*(.*)', ln)
+        if m:
+            key = m.group(1); out[key] = m.group(2).strip()
+        elif key and ln.strip():
+            out[key] += ' ' + ln.strip()
+    clean = lambda v: re.sub(r'^[>|][+-]?\s*', '', v).strip('\'" ')
+    return clean(out.get('name', '')) or None, clean(out.get('description', ''))
+
+
+def installed_skills(cwd):
+    """(full name, source, description chars) for each skill the sessions load."""
+    home = os.path.expanduser('~/.claude')
+    found = [('user', '', os.path.join(home, 'skills'))]
+    try:
+        enabled = [k for k, v in json.load(open(os.path.join(home, 'settings.json'))).get('enabledPlugins', {}).items() if v]
+        reg = json.load(open(os.path.join(home, 'plugins', 'installed_plugins.json')))['plugins']
+        # a plugin may keep its skills under skills or .claude/skills
+        found += [('plugin', k.split('@')[0] + ':', reg[k][0]['installPath'] + sub) for k in enabled if k in reg
+                  for sub in ('/skills', '/.claude/skills')]
+    except (OSError, ValueError, KeyError, IndexError):
+        pass
+    found.append(('project', '', os.path.join(cwd, '.claude', 'skills')))
+    for kind, prefix, base in found:
+        for f in sorted(glob.glob(os.path.join(base, '*', 'SKILL.md'))):
+            name, desc = frontmatter(f)
+            yield prefix + (name or os.path.basename(os.path.dirname(f))), kind, len(desc)
+
+
+def skills_mode(days, cwd):
+    try:
+        over = json.load(open(os.path.expanduser('~/.claude/settings.json'))).get('skillOverrides') or {}
+    except (OSError, ValueError):
+        over = {}
+    used = collections.Counter(name for _, f in transcripts(days) for kind, name in usage(f) if kind == 'skill')
+    rows = sorted(((used[n], n, k, c) for n, k, c in installed_skills(cwd)), key=lambda r: (r[0], -r[3]))
+    print(f'Installed skills, invocations in the last {days} days across all projects '
+          f'(Skill tool + typed /commands)\n')
+    print('uses  skill                                    source   chars  ~tokens  override')
+    for n, name, kind, chars in rows:
+        print(f'{n:4}  {name[:38]:38} {kind:8} {chars:6,} {chars // 4:8,}  {over.get(name, "")}')
+    idle = [r for r in rows if not r[0]]
+    chars = sum(r[3] for r in idle)
+    print(f'\n{len(idle)} of {len(rows)} skills never invoked: {chars:,} description chars (~{chars // 4:,} tokens) '
+          f'loaded into every session')
+
+
+def repos_mode(days):
+    proj, day = collections.defaultdict(collections.Counter), collections.defaultdict(collections.Counter)
+    first = time.strftime('%Y-%m-%d', time.localtime(time.time() - days * 86400))
+    for name, f in transcripts(days):
+        for _, ctx, out, ts in calls_ts(f):
+            if ts[:10] < first:
+                continue
+            for k, key in ((proj, name), (day, ts[:10])):
+                k[key]['in'] += ctx; k[key]['out'] += out
+    M = lambda n: f'{n / 1e6:,.1f}M'
+    print(f'Tokens per project folder, last {days} days (main thread and subagents)')
+    for name, k in sorted(proj.items(), key=lambda x: -x[1]['in']):
+        print(f'  {name[-48:]:48} {M(k["in"]):>9} in {M(k["out"]):>7} out')
+    print('\nTokens per day')
+    for name, k in sorted(day.items()):
+        print(f'  {name}  {M(k["in"]):>9} in {M(k["out"]):>7} out')
+
+
+def self_test():
+    def line(kind, mid, ctx, content=(), model='m'):
+        return json.dumps({'type': kind, 'message': {'id': mid, 'model': model, 'content': list(content),
+                           'usage': {'input_tokens': 1, 'cache_read_input_tokens': ctx - 1, 'output_tokens': 5}}}) + '\n'
+    with tempfile.TemporaryDirectory() as d:
+        use = {'type': 'tool_use', 'id': 't1', 'name': 'Bash'}
+        extra = [{'type': 'tool_use', 'id': 't2', 'name': 'Skill', 'input': {'skill': 'plug:skill'}},
+                 {'type': 'tool_use', 'id': 't3', 'name': 'Agent', 'input': {}},
+                 {'type': 'tool_use', 'id': 't4', 'name': 'mcp__playwright__browser_click'}]
+        res = {'type': 'tool_result', 'tool_use_id': 't1', 'content': [{'type': 'text', 'text': 'x' * 40},
+                                                                         {'type': 'image'}]}
+        with open(os.path.join(d, 's1.jsonl'), 'w') as f:
+            # one call written as two lines (dedup), a tool result, then a call past 800k
+            f.write(line('assistant', 'a', 100_000, [use] + extra) + line('assistant', 'a', 100_000))
+            f.write(json.dumps({'type': 'user', 'message': {'content': '<command-name>/cmd</command-name>'}}) + '\n')
+            f.write(json.dumps({'type': 'user', 'message': {'content': [res]}}) + '\n')
+            f.write('not json\n' + line('assistant', 'b', 900_000))
+        os.makedirs(os.path.join(d, 's1', 'subagents'))
+        with open(os.path.join(d, 's1', 'subagents', 'agent-x.jsonl'), 'w') as f:
+            f.write(line('assistant', 'c', 40_000, model='haiku') + line('assistant', 'd', 60_000, model='haiku'))
+        json.dump({'agentType': 'Explore'}, open(os.path.join(d, 's1', 'subagents', 'agent-x.meta.json'), 'w'))
+        s = collect(d, 1)
+        assert s['by'][('main', 'm')] == {'calls': 2, 'in': 1_000_000, 'out': 10}, s['by']
+        assert s['by'][('sub', 'haiku')]['in'] == 100_000
+        assert s['bucket'] == {0: 100_000, 4: 900_000}, s['bucket']
+        assert s['agents']['Explore'] == [(2, 100_000, 40_000, 60_000)]
+        assert s['sessions'] == [('s1', 2, 2, 1_000_000, 100_000, 100_000, 900_000)], s['sessions']
+        assert s['tools']['Bash'] == {'n': 1, 'chars': 40, 'images': 1}, s['tools']
+        u = s['use']
+        assert u['tool'] == {'Bash': 1, 'Skill': 1, 'Agent': 1, 'mcp__playwright__*': 1}, u['tool']
+        assert u['skill'] == {'plug:skill': 1, 'cmd': 1} and u['agent'] == {'general-purpose': 1}, u
+        assert frontmatter(os.path.join(d, 'none'))[1] == ''
+        assert last_context(os.path.join(d, 's1.jsonl')) == 900_000
+        assert collect(d, 0)['sessions'] == []
+    with tempfile.TemporaryDirectory() as h:
+        os.makedirs(os.path.join(h, '.claude'))
+        old, os.environ['HOME'] = os.environ['HOME'], h
+        try:
+            assert retention_days() == 30
+            open(os.path.join(h, '.claude', 'settings.json'), 'w').write('{"cleanupPeriodDays": 90}')
+            assert retention_days() == 90 and 'for 90 days' in advice('key AIza' + 'B' * 35, 0)[0]
+        finally:
+            os.environ['HOME'] = old
+    assert advice('fix the cart button', 10_000) == []
+    assert len(advice('x' * 31_000, 0)) == 1 and 'paste' in advice('x' * 31_000, 0)[0]
+    assert 'token-shaped' in advice('android : AIza' + 'B' * 35, 0)[0]
+    assert 'Broad request' in advice('do all of what is missing, then push', 0)[0]
+    assert 'Broad request' in advice('fix everything', 0)[0] and advice('add all the logins', 0) == []
+    assert 'fresh session' in advice('now the city tab', 200_000)[0]
+    assert 'fresh session' not in ' '.join(advice('now the city tab', 200_000, topic=False))
+    with tempfile.TemporaryDirectory() as d:  # topic nudge once per session, other nudges unchanged
+        global STATE
+        STATE = os.path.join(d, 'state')
+        import io, contextlib
+        def run(sid, prompt='now the city tab'):
+            sys.stdin = io.StringIO(json.dumps({'session_id': sid, 'prompt': prompt, 'transcript_path': os.path.join(d, 'p', 'x.jsonl')}))
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                hook(300)
+            return buf.getvalue()
+        os.makedirs(os.path.join(d, 'p'))
+        open(os.path.join(d, 'p', 'x.jsonl'), 'w').write(line('assistant', 'z', 200_000))
+        assert 'unrelated' in run('s-a') and 'unrelated' not in run('s-a') and 'unrelated' in run('s-b')
+        assert 'Broad request' in run('s-a', 'fix everything') and 'Context: 200k' in run('s-a')
+        sys.stdin = io.StringIO('[1,2]'); hook(300)  # valid JSON that is not an object: no crash
+        sys.stdin = sys.__stdin__
+    print('self-test passed')
+
+
+def folder_for(path):
+    path = os.path.abspath(path)
+    if glob.glob(os.path.join(path, '*.jsonl')):
+        return path
+    return os.path.join(PROJECTS, re.sub(r'[^A-Za-z0-9]', '-', path))
+
+
+if __name__ == '__main__':
+    args = sys.argv[1:]
+    if args[:1] == ['self-test']:
+        self_test()
+    elif args[:1] in (['skills'], ['repos']):
+        n = int(args[args.index('--days') + 1]) if '--days' in args else (30 if args[0] == 'skills' else 14)
+        skills_mode(n, os.getcwd()) if args[0] == 'skills' else repos_mode(n)
+    elif args[:1] == ['hook']:
+        hook(int(args[args.index('--over') + 1]) if '--over' in args else 300)
+    else:
+        days = 14
+        if '--days' in args:
+            i = args.index('--days'); days = int(args[i + 1]); del args[i:i + 2]
+        folder = folder_for(args[0] if args else os.getcwd())
+        if not os.path.isdir(folder):
+            sys.exit(f'No transcripts at {folder}')
+        report(collect(folder, days), days)

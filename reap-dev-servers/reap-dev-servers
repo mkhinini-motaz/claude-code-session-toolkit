@@ -1,0 +1,164 @@
+#!/usr/bin/env python3
+"""Stop dev servers that sessions started and never stopped.
+
+Sessions start Metro (`react-native start`, whose transform workers show up as jest-worker
+processes), `next dev` and test runs in the background, and nothing stops them when the session
+ends: five Metro servers, two `next dev` and an orphaned devtools can pile up and run for weeks. This
+runs from a SessionStart hook in ~/.claude/settings.json.
+
+A process is stopped, with its children, when all of these hold:
+  - its command is a dev server or a test run (PATTERNS below);
+  - it is older than --hours (default 12);
+  - neither it nor a child holds an established TCP connection (an emulator on Metro, a browser
+    tab on `next dev`);
+  - for Metro, no Android emulator is running (one may be booting towards it).
+Servers that are not in PATTERNS are never touched. To protect one that is (say a Metro you leave
+up on purpose), set REAP_KEEP to a ':'-separated list of substrings; a process whose command contains
+one is skipped.
+
+  reap-dev-servers [--hours N] [--dry-run]
+  reap-dev-servers self-test        (also --self-test)
+Any other argument prints usage and exits 2 without reaping.
+"""
+import math, os, re, signal, subprocess, sys, time
+
+PATTERNS = [
+    ('metro', re.compile(r'react-native(\.js)? start\b')),
+    ('next-dev', re.compile(r'\bnext dev\b')),
+    ('devtools', re.compile(r'react-native-devtools\b')),
+    ('jest', re.compile(r'/\.bin/jest\b|\bjest-worker/.*processChild\.js')),
+]
+LOG = os.path.expanduser('~/.claude/logs/reap-dev-servers.log')
+
+
+def seconds(etime):
+    """ps etime '[[DD-]HH:]MM:SS' to seconds."""
+    days, _, rest = etime.rpartition('-')
+    parts = [int(p) for p in rest.split(':')]
+    while len(parts) < 3:
+        parts.insert(0, 0)
+    return int(days or 0) * 86400 + parts[0] * 3600 + parts[1] * 60 + parts[2]
+
+
+def processes():
+    out = subprocess.run(['ps', '-Ao', 'pid=,ppid=,etime=,command='], capture_output=True, text=True).stdout
+    rows = {}
+    for line in out.splitlines():
+        pid, ppid, etime, cmd = line.split(None, 3)
+        rows[int(pid)] = (int(ppid), seconds(etime), cmd)
+    return rows
+
+
+def descendants(pid, rows):
+    found, todo = [], [pid]
+    while todo:
+        p = todo.pop()
+        kids = [c for c, (pp, _, _) in rows.items() if pp == p]
+        found += kids
+        todo += kids
+    return found
+
+
+def connected(pids):
+    out = subprocess.run(['lsof', '-a', '-p', ','.join(map(str, pids)), '-iTCP', '-sTCP:ESTABLISHED'],
+                         capture_output=True, text=True).stdout
+    return len(out.splitlines()) > 1
+
+
+def kept(cmd):
+    return any(k and k in cmd for k in os.environ.get('REAP_KEEP', '').split(':'))
+
+
+def parse(argv):
+    """Return (hours, dry). Any unknown argument is an error: a typo must never start a real run."""
+    hours, dry, a = 12.0, False, list(argv)
+    try:
+        while a:
+            x = a.pop(0)
+            if x == '--dry-run':
+                dry = True
+            elif x == '--hours':
+                hours = float(a.pop(0))
+            else:
+                raise ValueError(x)
+        if not math.isfinite(hours) or hours < 0:  # nan or a negative age would match every process
+            raise ValueError(hours)
+    except (ValueError, IndexError):
+        print('usage: reap-dev-servers [--hours N] [--dry-run] | self-test | --self-test', file=sys.stderr)
+        raise SystemExit(2)
+    return hours, dry
+
+
+def main(argv):
+    hours, dry = parse(argv)
+    rows = processes()
+    emulator = any('qemu-system' in cmd for _, _, cmd in rows.values())
+    me = os.getpid()
+    victims = []
+    for pid, (ppid, age, cmd) in rows.items():
+        kind = next((k for k, rx in PATTERNS if rx.search(cmd)), None)
+        if not kind or pid == me or age < hours * 3600 or kept(cmd):
+            continue
+        # A worker whose parent is itself a candidate goes with its parent.
+        if ppid in rows and any(rx.search(rows[ppid][2]) for _, rx in PATTERNS):
+            continue
+        if kind == 'metro' and emulator:
+            continue
+        tree = [pid] + descendants(pid, rows)
+        if connected(tree):
+            continue
+        victims.append((pid, kind, age, cmd, tree))
+    lines = []
+    for pid, kind, age, cmd, tree in victims:
+        lines.append(f'{time.strftime("%Y-%m-%d %H:%M")} {"would stop" if dry else "stopped"} {kind} pid {pid} '
+                     f'({len(tree)} processes, {age // 86400}d {age % 86400 // 3600}h): {cmd[:140]}')
+        if not dry:
+            for p in reversed(tree):
+                try:
+                    os.kill(p, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+    if victims and not dry:
+        time.sleep(3)
+        for _, _, _, _, tree in victims:
+            for p in tree:
+                try:
+                    os.kill(p, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+    if lines:
+        print('\n'.join(lines))
+        if not dry:
+            os.makedirs(os.path.dirname(LOG), exist_ok=True)
+            with open(LOG, 'a') as f:
+                f.write('\n'.join(lines) + '\n')
+
+
+def self_test():
+    assert seconds('05:07') == 307
+    assert seconds('01:00:00') == 3600
+    assert seconds('4-16:10:10') == 4 * 86400 + 16 * 3600 + 610
+    hit = lambda c: next((k for k, rx in PATTERNS if rx.search(c)), None)
+    assert hit('node /x/app/node_modules/.bin/react-native start --port 8083') == 'metro'
+    assert hit('node /x/web/node_modules/.bin/next dev -p 3005') == 'next-dev'
+    assert hit('node /x/node_modules/jest-worker/build/workers/processChild.js') == 'jest'
+    assert hit('node index.js') is None, 'an ordinary server must never match'
+    assert hit('php artisan serve --port=8001') is None, 'an ordinary server must never match'
+    os.environ['REAP_KEEP'] = 'keepme:other'
+    assert kept('node /x/keepme/node_modules/.bin/next dev') and not kept('node /x/web/node_modules/.bin/next dev')
+    del os.environ['REAP_KEEP']
+    assert not kept('anything'), 'empty REAP_KEEP keeps nothing'
+    assert parse([]) == (12.0, False) and parse(['--hours', '3', '--dry-run']) == (3.0, True)
+    import contextlib, io
+    for bad in (['--dryrun'], ['--hours'], ['--hours', 'x'], ['stray'], ['--hours', 'nan'], ['--hours', 'inf'], ['--hours', '-1']):
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):  # the usage text is expected here
+                parse(bad)
+            raise AssertionError(f'{bad} must be rejected')
+        except SystemExit as e:
+            assert e.code == 2
+    print('self-test ok')
+
+
+if __name__ == '__main__':
+    self_test() if sys.argv[1:] in (['self-test'], ['--self-test']) else main(sys.argv[1:])

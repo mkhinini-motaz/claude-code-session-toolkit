@@ -1,0 +1,97 @@
+#!/usr/bin/env python3
+"""commit --by opus|sonnet|fable|haiku -m <msg> [-m <para>...] [--session <url>] <paths...>
+Path-scoped commit for shared trees: git add -N on untracked paths, git commit --only <paths>,
+trailers (Co-Authored-By from --by, Claude-Session from --session or $CLAUDE_CODE_BRIDGE_SESSION_ID),
+then git show --stat HEAD. Exit 1 when the committed files differ from the changed files under the
+paths (a hook or a rename pulled one in or out); recovery: git reset --soft HEAD~1.
+Never uses -a, -A, . or -u. `commit --self-test` runs it in a temp repo."""
+import os, subprocess, sys, tempfile
+
+MODELS = {'opus': 'Opus 5.5', 'sonnet': 'Sonnet 5.5', 'fable': 'Fable 5.2', 'haiku': 'Haiku 5.5'}
+
+
+def git(*a, check=True, **k):
+    return subprocess.run(['git', *a], text=True, capture_output=True, check=check, **k).stdout
+
+
+def die(msg, code=2):
+    print('commit: ' + msg, file=sys.stderr)
+    sys.exit(code)
+
+
+def main(argv):
+    by, msgs, session, paths, dd = None, [], None, [], False
+    it = iter(argv)
+    for a in it:
+        if dd: paths.append(a)  # after --, a path may start with -
+        elif a == '--by': by = next(it, None)
+        elif a == '-m': msgs.append(next(it, None))
+        elif a == '--session': session = next(it, None)
+        elif a.startswith('-') and a != '--': die(f'unknown option {a}')
+        elif a == '--': dd = True
+        else: paths.append(a)
+    if by not in MODELS: die('--by opus|sonnet|fable|haiku is required')
+    if not msgs or None in msgs: die('-m <message> is required')
+    if not paths: die('name the paths to commit')
+    if any(p in ('.', './', ':/', '*') for p in paths): die('name files or directories, never . or *')
+    sid = os.environ.get('CLAUDE_CODE_BRIDGE_SESSION_ID')
+    if not session:
+        if not sid: die('no $CLAUDE_CODE_BRIDGE_SESSION_ID: pass --session <url>')
+        session = 'https://claude.ai/code/' + sid
+    try: git('rev-parse', '--git-dir')
+    except subprocess.CalledProcessError: die('not in a git repo')
+    new = [p for p in git('ls-files', '-o', '--exclude-standard', '--', *paths).split('\n') if p]
+    if new: git('add', '-N', '--', *new)
+    # no commits yet: every file under the paths is new
+    cmd = ['diff', '--name-only', 'HEAD'] if git('rev-parse', '-q', '--verify', 'HEAD', check=False).strip() else ['ls-files']
+    want = set(git(*cmd, '--', *paths).split('\n')) - {''}
+    if not want: die('nothing changed under the given paths', 1)
+    body = '\n\n'.join(msgs) + f'\n\nCo-Authored-By: Claude {MODELS[by]} <noreply@anthropic.com>\nClaude-Session: {session}\n'
+    r = subprocess.run(['git', 'commit', '--only', '-m', body, '--', *paths], text=True, capture_output=True)
+    sys.stdout.write(r.stdout); sys.stderr.write(r.stderr)
+    if r.returncode: sys.exit(r.returncode)
+    print(git('show', '--stat', 'HEAD'), end='')
+    got = set(git('show', '--name-only', '--format=', 'HEAD').split('\n')) - {''}
+    if got != want:
+        print(f'commit: MISMATCH. Committed but not changed under the paths: {sorted(got - want)}; '
+              f'changed but not committed: {sorted(want - got)}. Undo with: git reset --soft HEAD~1', file=sys.stderr)
+        sys.exit(1)
+
+
+def self_test():
+    d = tempfile.mkdtemp(); me = os.path.abspath(__file__)
+    env = dict(os.environ, CLAUDE_CODE_BRIDGE_SESSION_ID='sess_test')
+    def sh(*a, **k): return subprocess.run(a, cwd=d, text=True, capture_output=True, env=env, **k)
+    sh('git', 'init', '-q'); sh('git', 'config', 'user.email', 't@t'); sh('git', 'config', 'user.name', 't')
+    open(d + '/a.txt', 'w').write('a\n'); open(d + '/b.txt', 'w').write('b\n')
+    sh('git', 'add', 'a.txt', 'b.txt'); sh('git', 'commit', '-qm', 'init')
+    # 1. changed + new file
+    open(d + '/a.txt', 'a').write('x\n'); open(d + '/new.txt', 'w').write('n\n'); open(d + '/b.txt', 'a').write('other session\n')
+    r = sh(me, '--by', 'haiku', '-m', 'one', '-m', 'para', 'a.txt', 'new.txt')
+    assert r.returncode == 0, r.stderr
+    msg = sh('git', 'log', '-1', '--format=%B').stdout
+    assert 'Co-Authored-By: Claude Haiku 5.5 <noreply@anthropic.com>' in msg and 'Claude-Session: https://claude.ai/code/sess_test' in msg, msg
+    assert sh('git', 'show', '--name-only', '--format=', 'HEAD').stdout.split() == ['a.txt', 'new.txt']
+    assert ' M b.txt' in sh('git', 'status', '--porcelain').stdout  # foreign edit left alone
+    # 2. no session id and no --session: refused
+    env.pop('CLAUDE_CODE_BRIDGE_SESSION_ID')
+    assert sh(me, '--by', 'opus', '-m', 'x', 'b.txt').returncode == 2
+    # 3. a pre-commit hook adds an extra file: count differs, exit 1
+    open(d + '/.git/hooks/pre-commit', 'w').write('#!/bin/sh\necho z > extra.txt; git add extra.txt\n')
+    os.chmod(d + '/.git/hooks/pre-commit', 0o755)
+    r = sh(me, '--by', 'sonnet', '--session', 'https://s/1', '-m', 'two', 'b.txt')
+    assert r.returncode == 1 and 'extra.txt' in r.stderr and 'git reset --soft HEAD~1' in r.stderr, (r.returncode, r.stderr)
+    # 4. a path starting with - after --, and a repo with no commits yet
+    open(d + '/-dash.txt', 'w').write('d\n')
+    r = sh(me, '--by', 'opus', '--session', 'https://s/1', '-m', 'dash', '--', '-dash.txt')
+    assert r.returncode == 0 and '-dash.txt' in sh('git', 'show', '--name-only', '--format=', 'HEAD').stdout, r.stderr
+    d = tempfile.mkdtemp(); sh('git', 'init', '-q'); sh('git', 'config', 'user.email', 't@t'); sh('git', 'config', 'user.name', 't')
+    open(d + '/f.txt', 'w').write('f\n')
+    r = sh(me, '--by', 'opus', '--session', 'https://s/1', '-m', 'first', 'f.txt')
+    assert r.returncode == 0 and sh('git', 'show', '--name-only', '--format=', 'HEAD').stdout.split() == ['f.txt'], r.stderr
+    print('self-test ok')
+
+
+if __name__ == '__main__':
+    if sys.argv[1:] == ['--self-test']: self_test()
+    else: main(sys.argv[1:])

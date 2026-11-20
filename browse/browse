@@ -1,0 +1,167 @@
+#!/usr/bin/env node
+/**
+ * Scripted web walk: one Bash call runs a whole browser check (headless Chrome through playwright-core).
+ *   bin/browse [options] steps.txt     steps from a file, or `-` for stdin; `bin/browse --self-test`, `--help`
+ *   --base URL   --width PX (1280; 390 = phone)   --lang CODE   --out DIR   --timeout MS (5000)
+ * One step per line, `#` comments and blank lines ignored, multi-word arguments in "double quotes":
+ *   goto <url|/path>   click <text|css=sel>   fill <label|placeholder|css=sel> <value>   press <key>
+ *   expect <text>   expect-not <text>   wait <ms>   shot <name>
+ * Prints `ok N step` per step, stops at the first FAIL (fail.png, exit 1), then console errors,
+ * failed requests (4xx/5xx) and screenshot paths. Never prints page HTML. See README.md.
+ * Playwright: playwright-core 1.49.1 from ~/.cache/browse-playwright (installed there on first use);
+ * the browser is the installed Google Chrome. No browser download.
+ */
+const { createRequire } = require('module');
+const fs = require('fs'), os = require('os'), path = require('path'), http = require('http'), cp = require('child_process');
+
+const CACHE = path.join(process.env.XDG_CACHE_HOME || path.join(os.homedir(), '.cache'), 'browse-playwright');
+function playwright() {
+  if (!fs.existsSync(path.join(CACHE, 'node_modules/playwright-core')))
+    cp.execFileSync('npm', ['i', '--silent', '--prefix', CACHE, 'playwright-core@1.49.1'], { stdio: 'inherit' });
+  return createRequire(path.join(CACHE, 'x.js'))('playwright-core');
+}
+
+const tokens = (line) => [...line.matchAll(/"([^"]*)"|(\S+)/g)].map((m) => m[1] ?? m[2]);
+const cut = (s, n) => (s.length > n ? s.slice(0, n) + '…' : s);
+
+// Run steps; returns { code }. `emit` receives each output line.
+async function run(opts, text, emit) {
+  const { chromium } = playwright();
+  const browser = await chromium.launch({ channel: 'chrome', headless: true });
+  const ctx = await browser.newContext({
+    viewport: { width: opts.width, height: opts.width < 600 ? 844 : 800 },
+    ...(opts.lang ? { extraHTTPHeaders: { 'Accept-Language': opts.lang } } : {}),
+  });
+  if (opts.lang && opts.base) await ctx.addCookies([{ name: 'lang', value: opts.lang, url: opts.base }]);
+  const page = await ctx.newPage();
+  const errors = [], bad = [], shots = [];
+  page.on('console', (m) => m.type() === 'error' && errors.push(m.text()));
+  page.on('pageerror', (e) => errors.push(String(e.message || e)));
+  page.on('response', (r) => r.status() >= 400 && bad.push(`${r.status()} ${r.request().method()} ${new URL(r.url()).pathname}`));
+  fs.mkdirSync(opts.out, { recursive: true });
+  const at = () => { try { const u = new URL(page.url()); return u.pathname + u.search; } catch { return page.url(); } };
+
+  // First visible match of the candidates, polled until the timeout.
+  // `top`: skip a match another element covers (a modal over the page), or click would wait for it to go.
+  const uncovered = (l) => l.evaluate((e) => { const r = e.getBoundingClientRect(), t = document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2); return !!t && (e.contains(t) || t.contains(e)); }).catch(() => false);
+  const find = async (cands, top) => {
+    const end = Date.now() + opts.timeout;
+    do {
+      for (const c of cands) for (const l of await c.all()) if (await l.isVisible().catch(() => false) && (!top || await uncovered(l))) return l;
+      await page.waitForTimeout(100);
+    } while (Date.now() < end);
+    return null;
+  };
+  const target = (t) => t.startsWith('css=') ? [page.locator(t.slice(4))] : [
+    page.getByRole('button', { name: t }), page.getByRole('link', { name: t }), page.getByText(t)];
+  const fieldOf = (t) => t.startsWith('css=') ? [page.locator(t.slice(4))] : [page.getByLabel(t), page.getByPlaceholder(t)];
+
+  const steps = text.split('\n').map((l) => l.trim()).filter((l) => l && !l.startsWith('#'));
+  let code = 0;
+  for (let i = 0; i < steps.length; i++) {
+    const [cmd, ...a] = tokens(steps[i]);
+    const label = `${cmd}${a.length ? ' ' + a.map((x) => `"${x}"`).join(' ') : ''}`;
+    try {
+      if (cmd === 'goto') {
+        const u = /^(https?|file):/.test(a[0]) ? a[0] : (opts.base || '').replace(/\/$/, '') + a[0];
+        if (!/^(https?|file):/.test(u)) throw new Error('no --base for a path');
+        await page.goto(u, { timeout: opts.timeout * 3, waitUntil: 'load' });
+      } else if (cmd === 'click') {
+        const l = await find(target(a[0]), true); if (!l) throw new Error(`not found or not visible after ${opts.timeout / 1000} s`);
+        await l.click({ timeout: opts.timeout });
+      } else if (cmd === 'fill') {
+        const l = await find(fieldOf(a[0])); if (!l) throw new Error(`field not found after ${opts.timeout / 1000} s`);
+        await l.fill(a.slice(1).join(' '), { timeout: opts.timeout });
+      } else if (cmd === 'press') await page.keyboard.press(a[0]);
+      else if (cmd === 'expect') {
+        if (!(await find([page.getByText(a[0])]))) throw new Error(`not visible after ${opts.timeout / 1000} s`);
+      } else if (cmd === 'expect-not') {
+        const end = Date.now() + opts.timeout; let seen = true;
+        while (seen && Date.now() < end) { seen = false; for (const l of await page.getByText(a[0]).all()) if (await l.isVisible().catch(() => false)) seen = true; if (seen) await page.waitForTimeout(100); }
+        if (seen) throw new Error(`still visible after ${opts.timeout / 1000} s`);
+      } else if (cmd === 'wait') await page.waitForTimeout(Number(a[0]));
+      else if (cmd === 'shot') { const f = path.join(opts.out, a[0].replace(/\.png$/, '') + '.png'); await page.screenshot({ path: f }); shots.push(f); }
+      else throw new Error('unknown step');
+      emit(`ok ${i + 1} ${label}`);
+    } catch (e) {
+      const msg = String(e.message).split('\n')[0];
+      emit(`FAIL ${i + 1} ${label}: ${cut(msg, 200)} (at ${at()})`);
+      const f = path.join(opts.out, 'fail.png'); await page.screenshot({ path: f }).catch(() => {}); shots.push(f);
+      code = 1; break;
+    }
+  }
+  emit(`console errors: ${errors.length}`); errors.slice(0, 3).forEach((e) => emit('  ' + cut(e.replace(/\s+/g, ' '), 200)));
+  emit(`failed requests: ${bad.length}`); bad.slice(0, 3).forEach((e) => emit('  ' + e));
+  shots.forEach((s) => emit('shot ' + s));
+  await browser.close();
+  return { code, errors, bad };
+}
+
+const FIXTURE = `<!doctype html><html lang=en><body><h1>Fixture</h1><p id=ck></p>
+<button id=b>Sign in</button><p id=r hidden>Welcome back</p><p id=gone>Loading spinner</p>
+<div style="position:relative"><button id=under>Pick me</button><div style="position:absolute;inset:0;background:#fff"><li id=over>Pick me</li></div></div>
+<label>Phone <input id=ph></label><input id=pw placeholder="Secret word"><p id=out></p>
+<script>
+ck.textContent='cookie '+document.cookie+' lang '+navigator.language;
+b.onclick=()=>{r.hidden=false;fetch('/missing');console.error('fixture boom '+'x'.repeat(300))};
+over.onclick=()=>{out.textContent='picked over'};under.onclick=()=>{out.textContent='picked under'};
+setTimeout(()=>gone.remove(),300);
+document.onkeydown=(e)=>{out.textContent='key '+e.key+' phone '+ph.value+' pw '+pw.value};
+</script></body></html>`;
+
+async function selfTest() {
+  const srv = http.createServer((q, s) => {
+    if (q.url === '/missing') { s.statusCode = 404; return s.end('no'); }
+    s.setHeader('content-type', 'text/html'); s.end(FIXTURE);
+  });
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+  const base = `http://127.0.0.1:${srv.address().port}`;
+  const out = fs.mkdtempSync(path.join(os.tmpdir(), 'browse-self-'));
+  const opts = { base, width: 390, lang: 'fr', out, timeout: 1500 };
+  let n = 0; const bad = (m) => { console.log('SELF-TEST FAIL: ' + m); n++; };
+  const good = [
+    '# every step kind', 'goto /', 'expect "cookie lang=fr"', 'expect-not "Loading spinner"', 'expect-not "Welcome back"',
+    'click "Sign in"', 'expect "Welcome back"', 'fill Phone 55 123', 'fill "Secret word" abc', 'fill css=#ph 99',
+    'click "Pick me"', 'expect "picked over"', 'press Enter', 'expect "key Enter phone 99 pw abc"', 'wait 50', 'shot home', 'click css=#b',
+  ].join('\n');
+  const lines = []; let r = await run(opts, good, (l) => lines.push(l));
+  console.log(lines.join('\n'));
+  const joined = lines.join('\n');
+  if (r.code !== 0) bad('good walk failed');
+  if (r.bad.length < 1 || !/404 GET \/missing/.test(joined)) bad('404 not reported');
+  if (!/fixture boom/.test(joined) || /x{201}/.test(joined)) bad('console error missing or not cut');
+  if (!fs.existsSync(path.join(out, 'home.png'))) bad('shot home.png missing');
+  const l2 = []; r = await run(opts, 'goto /\nexpect "Nothing like this"\nshot never', (l) => l2.push(l));
+  console.log(l2.join('\n'));
+  if (r.code !== 1 || !/^FAIL 2 expect "Nothing like this": not visible after 1.5 s \(at \/\)/m.test(l2.join('\n'))) bad('failing walk did not fail as expected');
+  if (l2.some((l) => l.startsWith('ok 3')) || !fs.existsSync(path.join(out, 'fail.png'))) bad('did not stop at first failure / no fail.png');
+  const h = cp.spawnSync(process.execPath, [__filename, '--help'], { encoding: 'utf8' });  // 21 Nov: --help was read as a steps file (ENOENT)
+  if (h.status !== 2 || !/goto <url/.test(h.stderr) || /ENOENT/.test(h.stderr)) bad('--help did not print usage');
+  if (cp.spawnSync(process.execPath, [__filename, '--bogus'], { encoding: 'utf8' }).status !== 2) bad('unknown option not rejected');
+  srv.close(); fs.rmSync(out, { recursive: true, force: true });
+  console.log(n ? `self-test: ${n} problem(s)` : 'self-test: all ok');
+  process.exit(n ? 1 : 0);
+}
+
+(async () => {
+  const argv = process.argv.slice(2);
+  const opts = { base: '', width: 1280, lang: '', timeout: 5000,
+    out: path.join(os.tmpdir(), `browse-${process.getuid()}`) };
+  let file = null;
+  for (let i = 0; i < argv.length; i++) {
+    const k = argv[i];
+    if (k === '--self-test') return selfTest();
+    else if (k === '-h' || k === '--help') { file = null; break; }
+    else if (k === '--base') opts.base = argv[++i];
+    else if (k === '--width') opts.width = Number(argv[++i]);
+    else if (k === '--lang') opts.lang = argv[++i];
+    else if (k === '--out') opts.out = argv[++i];
+    else if (k === '--timeout') opts.timeout = Number(argv[++i]);
+    else if (k.startsWith('--')) { console.error(`browse: unknown option ${k}`); process.exit(2); }
+    else file = k;
+  }
+  if (!file) { console.error(fs.readFileSync(__filename, 'utf8').split('\n').slice(2, 8).join('\n').replace(/^ \* ?/gm, '')); process.exit(2); }
+  const text = fs.readFileSync(file === '-' ? 0 : file, 'utf8');
+  const { code } = await run(opts, text, (l) => console.log(l));
+  process.exit(code);
+})().catch((e) => { console.error('browse: ' + (e.message || e)); process.exit(2); });

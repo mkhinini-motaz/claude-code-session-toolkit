@@ -1,0 +1,44 @@
+#!/bin/zsh
+# Google Play refuses an app targeting Android 15+ whose native libraries are not 16 KB aligned.
+# Builds each app's release APK (arm64-v8a and x86_64), then checks the zip alignment and every
+# library's ELF LOAD alignment. Exits 1 if any app fails.
+#   check-16kb app1 app2               # app folders under $APPS_DIR (default: the current folder)
+#   APPS_DIR=~/work check-16kb app1
+# $ANDROID_HOME (or sdk.dir in <app>/android/local.properties) names the SDK; it needs build-tools and an NDK.
+# An app without android/release-signing.properties is signed with a throwaway key made here;
+# an existing properties file is used as it is and never touched. A build takes 5 to 15 minutes
+# per app (over two hours on a loaded machine): run one at a time.
+set -u
+(( $# )) || { sed -n 2,9p $0; exit 2; }
+APPS=${APPS_DIR:-$PWD}
+SDK=${ANDROID_HOME:-$(sed -n 's/^sdk.dir=//p' $APPS/$1/android/local.properties 2>/dev/null)}
+BT=$(ls -d $SDK/build-tools/*(/N) | sort -V | tail -1)
+OD=$(ls $SDK/ndk/*/toolchains/llvm/prebuilt/*/bin/llvm-objdump(N) | sort -V | tail -1)
+[[ -x $BT/zipalign && -x $OD ]] || { echo "need build-tools and an NDK under $SDK"; exit 2; }
+W=$(mktemp -d); mk=; trap 'rm -rf $W; [[ -n $mk ]] && rm -f $mk' EXIT
+fail=0
+for a in "$@"; do
+  d=$APPS/$a/android; made=0
+  if [[ ! -f $d/release-signing.properties ]]; then
+    [[ -f $W/k.jks ]] || keytool -genkeypair -keystore $W/k.jks -alias t -keyalg RSA -keysize 2048 \
+      -validity 1 -storepass throwaway1 -keypass throwaway1 -dname CN=throwaway >/dev/null 2>&1
+    printf 'storeFile=%s\nstorePassword=throwaway1\nkeyAlias=t\nkeyPassword=throwaway1\n' $W/k.jks > $d/release-signing.properties
+    made=1; mk=$d/release-signing.properties
+  fi
+  (cd $d && ./gradlew :app:assembleRelease -PreactNativeArchitectures=arm64-v8a,x86_64 -q >$W/$a.log 2>&1)
+  ok=$?; (( made )) && rm -f $d/release-signing.properties; mk=
+  apk=$d/app/build/outputs/apk/release/app-release.apk
+  if (( ok != 0 )) || [[ ! -f $apk ]]; then echo "$a: BUILD FAILED"; tail -5 $W/$a.log; fail=1; continue; fi
+  $BT/zipalign -c -P 16 -v 4 $apk >/dev/null 2>&1 && za=ok || { za=FAIL; fail=1; }
+  mkdir -p $W/$a; unzip -q -o $apk 'lib/*' -d $W/$a
+  n=0; bad=()
+  for so in $W/$a/lib/*/*.so(N); do
+    n=$((n+1))
+    al=$($OD -p $so | awk '/LOAD/{for(i=1;i<=NF;i++) if($i=="align") print $(i+1)}')
+    # no LOAD line at all (wrong file, tool failed) counts as bad, not as aligned
+    [[ -z $al ]] || print -r -- $al | grep -qvE '^2\*\*(1[4-9]|[2-9][0-9])$' && bad+=(${so#$W/$a/})
+  done
+  (( ${#bad} )) && fail=1
+  echo "$a: zipalign $za, $n libraries, ${#bad} below 16 KB ${bad[*]}"
+done
+exit $fail

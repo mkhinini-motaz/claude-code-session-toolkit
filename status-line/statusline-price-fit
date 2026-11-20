@@ -1,0 +1,91 @@
+#!/usr/bin/env python3
+"""Re-measure the $ per million weighted tokens that statusline-command.sh
+uses to estimate each subagent's cost (its `price` function in cost_jq).
+
+Transcripts hold tokens, not dollars. Weighted tokens = input + 1.25 x 5m cache
+write + 2 x 1h cache write + 0.1 x cache read + 5 x output. This fits one price per
+model family by least squares against the real .cost.total_cost_usd that the status
+line saves per session (~/.claude/statusline-usage/cost-<session>), main thread plus
+its subagents, and prints each session's error so a wrong price shows up.
+
+Usage: [FIT_PROJECT=<dir>] statusline-price-fit [--project DIR] [sessions=25] [session-id-prefix-to-skip ...]
+Skip a session whose real cost is far from its tokens (a resumed one), by its id prefix.
+Reads one project's transcripts: $FIT_PROJECT is that folder under ~/.claude/projects (required), or pass it
+as --project DIR. Sessions saved by the status line but found in another project are left out.
+On one machine, 13 Nov 2026, 18 sessions: opus 3.1, sonnet 1.7, fable 8, haiku unfit.
+"""
+import collections, glob, json, os, sys
+
+args = sys.argv[1:]
+if '--project' in args:
+    i = args.index('--project'); os.environ['FIT_PROJECT'] = args[i + 1]; del args[i:i + 2]
+proj = os.environ.get('FIT_PROJECT') or sys.exit(__doc__)
+proj = os.path.expanduser(proj)
+count = int(args[0]) if args else 25
+skip = args[1:]
+fams = ['opus', 'sonnet', 'haiku', 'fable']
+
+
+def units(path):
+    first = {}
+    for line in open(path, errors='replace'):
+        if '"type":"assistant"' not in line:
+            continue
+        try:
+            d = json.loads(line)
+        except ValueError:
+            continue
+        m = d.get('message') or {}
+        if d.get('type') == 'assistant' and m.get('id'):
+            first.setdefault(m['id'], m)
+    out = collections.Counter()
+    for m in first.values():
+        u = m.get('usage') or {}
+        fam = next((f for f in fams if f in (m.get('model') or '')), None)
+        if not fam:
+            continue
+        w1 = (u.get('cache_creation') or {}).get('ephemeral_1h_input_tokens', 0)
+        out[fam] += (u.get('input_tokens', 0) + 1.25 * (u.get('cache_creation_input_tokens', 0) - w1) + 2 * w1
+                     + 0.1 * u.get('cache_read_input_tokens', 0) + 5 * u.get('output_tokens', 0)) / 1e6
+    return out
+
+
+rows = []
+ledgers = sorted(glob.glob(os.path.expanduser('~/.claude/statusline-usage/cost-*')), key=os.path.getmtime)
+for lf in ledgers[-count:]:
+    sid = lf.split('cost-')[1]
+    cost = float(open(lf).read().split()[0])
+    main = f'{proj}/{sid}.jsonl'
+    if cost <= 0 or not os.path.exists(main) or any(sid.startswith(s) for s in skip):
+        continue
+    t = units(main)
+    for g in glob.glob(f'{proj}/{sid}/subagents/*.jsonl'):
+        t += units(g)
+    rows.append((sid[:8], cost, [t[f] for f in fams]))
+
+# Least squares over the families that appear; normal equations, Gauss elimination.
+used = [i for i in range(len(fams)) if any(r[2][i] for r in rows)]
+X = [[r[2][i] for i in used] for r in rows]
+y = [r[1] for r in rows]
+n = len(used)
+if not rows:
+    sys.exit('no sessions found: check --project and ~/.claude/statusline-usage')
+if len(rows) < max(n, 1):  # fewer sessions than prices: any answer fits, so the prices mean nothing
+    sys.exit(f'{len(rows)} session(s) for {n} model families: need at least {n}. Pass more sessions or another --project.')
+A = [[sum(r[i] * r[j] for r in X) for j in range(n)] for i in range(n)]
+b = [sum(r[i] * v for r, v in zip(X, y)) for i in range(n)]
+scale = [max(abs(x) for x in A[i]) for i in range(n)]  # a pivot is zero relative to its own row
+for i in range(n):
+    if abs(A[i][i]) <= 1e-9 * scale[i]:
+        sys.exit(f'{fams[used[i]]} cannot be told apart from the other families in these sessions; add sessions where they differ.')
+    for j in range(i + 1, n):
+        k = A[j][i] / A[i][i]
+        A[j] = [a - k * c for a, c in zip(A[j], A[i])]
+        b[j] -= k * b[i]
+x = [0.0] * n
+for i in reversed(range(n)):
+    x[i] = (b[i] - sum(A[i][j] * x[j] for j in range(i + 1, n))) / A[i][i]
+print('$ per million weighted tokens:', {fams[i]: round(v, 2) for i, v in zip(used, x)})
+for (sid, cost, _), r in zip(rows, X):
+    est = sum(a * c for a, c in zip(r, x))
+    print(f'{sid}  real ${cost:8.2f}  fit ${est:8.2f}  {100 * (est - cost) / cost:+4.0f}%')

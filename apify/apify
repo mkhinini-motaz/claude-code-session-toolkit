@@ -1,0 +1,206 @@
+#!/usr/bin/env python3
+"""apify: Apify's REST API in one call each, as compact TSV, in place of the Apify MCP connector.
+  apify search <words>                          Store actors: id, title, users, rating, pricing
+  apify schema <actor>                          input fields: name, type, default, required, title (cached 7 days)
+  apify run <actor> <input.json|-> --max-usd N [--fields a,b.c,d:300] [--limit N] [--max-items N] [--timeout SEC]
+                                                start, wait, then print the items; cost and run line on stderr
+  apify items <dataset|run id> [--fields ...] [--limit 50] [--offset 0] [--json]
+                                                no --fields: the field list with types and average sizes
+  apify runs [--limit 10]                       recent runs: id, actor, status, started, cost, dataset
+  apify --self-test
+<actor> is `user~name` or `user/name`. --fields takes dot paths, and `:N` cuts a value to N characters.
+--max-usd is required: it is sent as maxTotalChargeUsd (pay-per-event actors stop there); other actors bill compute,
+so check `apify schema` and the Store price first.
+Token: APIFY_TOKEN, else the keychain item `apify-api`, else ~/.apify_token;
+it is read in-process and never printed."""
+import json, os, socket, subprocess, sys, time, urllib.error, urllib.parse, urllib.request
+
+API = "https://api.apify.com/v2"
+CACHE = os.path.expanduser("~/.cache/apify")
+_gai = socket.getaddrinfo  # IPv4 first: IPv6 hung on one network (same fix as notion-push)
+socket.getaddrinfo = lambda *a, **k: sorted(_gai(*a, **k), key=lambda r: r[0] != socket.AF_INET)
+
+def token():
+    t = os.environ.get("APIFY_TOKEN")
+    if not t:
+        try:
+            r = subprocess.run(["security", "find-generic-password", "-s", "apify-api", "-w"], capture_output=True, text=True)
+            t = r.stdout.strip() if r.returncode == 0 else ""
+        except FileNotFoundError:  # no keychain tool (Linux)
+            t = ""
+    if not t and os.path.exists(os.path.expanduser("~/.apify_token")):
+        t = open(os.path.expanduser("~/.apify_token")).read().strip()
+    if not t:
+        sys.exit("No Apify token. Copy it from console.apify.com > Settings > API & Integrations, then: "
+                 "security add-generic-password -a \"$USER\" -s apify-api -w   (or export APIFY_TOKEN)")
+    return t
+
+def call(method, path, body=None, **q):
+    q = {k: v for k, v in q.items() if v is not None}
+    url = API + path + ("?" + urllib.parse.urlencode(q) if q else "")
+    req = urllib.request.Request(url, method=method, data=None if body is None else json.dumps(body).encode(),
+                                 headers={"Authorization": "Bearer " + token(), "Content-Type": "application/json"})
+    for attempt in range(4):  # a GET is retried on 429, 5xx and network errors; a POST never (it could start a second paid run)
+        try:
+            with urllib.request.urlopen(req, timeout=90) as r: return json.load(r)
+        except urllib.error.HTTPError as e:
+            if method != "GET" or attempt == 3 or not (e.code == 429 or e.code >= 500):
+                sys.exit(f"apify: HTTP {e.code} on {method} {path}: {e.read().decode(errors='replace')[:300]}")
+        except OSError as e:  # URLError, read timeouts, resets
+            if method != "GET" or attempt == 3: sys.exit(f"apify: network error on {method} {path}: {getattr(e, 'reason', e)}")
+        time.sleep(2 ** attempt)
+
+def aid(a): return a.replace("/", "~")
+
+def cell(v, n=120):
+    if isinstance(v, list): v = "; ".join(cell(x, n) for x in v)
+    elif isinstance(v, dict): v = json.dumps(v, ensure_ascii=False, separators=(",", ":"))
+    v = "" if v is None else str(v)
+    v = " ".join(v.split())
+    return v if len(v) <= n else v[: n - 1] + "…"
+
+def pick(item, path):
+    for k in path.split("."):
+        if isinstance(item, list): item = [x.get(k) if isinstance(x, dict) else None for x in item]
+        elif isinstance(item, dict): item = item.get(k)
+        else: return None
+    return item
+
+def table(rows, fields):
+    spec = [(f.split(":")[0], int(f.split(":")[1]) if ":" in f else 120) for f in fields]
+    out = ["\t".join(p for p, _ in spec)]
+    out += ["\t".join(cell(pick(r, p), n) for p, n in spec) for r in rows]
+    return "\n".join(out)
+
+def field_list(rows):
+    seen = {}
+    for r in rows:
+        for k, v in r.items():
+            t, n = seen.get(k, (type(v).__name__, 0)); seen[k] = (t, n + len(json.dumps(v, ensure_ascii=False)))
+    return "\n".join(f"{k}\t{t}\tavg {n // max(len(rows), 1)} chars" for k, (t, n) in sorted(seen.items(), key=lambda x: -x[1][1]))
+
+def opt(a, name, default=None):
+    return a[a.index(name) + 1] if name in a and a.index(name) + 1 < len(a) else default
+
+def items(a, ds=None):
+    ref = ds or a[0]
+    if not ds:
+        try: ref = call("GET", f"/actor-runs/{ref}")["data"]["defaultDatasetId"]
+        except SystemExit: pass  # not a run id: a dataset id
+    fields = opt(a, "--fields"); limit = int(opt(a, "--limit", 50)); off = int(opt(a, "--offset", 0))
+    top = ",".join(sorted({f.split(":")[0].split(".")[0] for f in fields.split(",")})) if fields else None
+    n = limit if fields or "--json" in a or "--limit" in a else 20  # bare call: a 20-row sample for the field list
+    rows = call("GET", f"/datasets/{ref}/items", clean=1, format="json", limit=n, offset=off, fields=top)
+    if "--json" in a: return json.dumps(rows, ensure_ascii=False)  # whole, for piping (a cut broke the JSON)
+    if not fields:
+        return f"{len(rows)} sample items; pick fields with --fields a,b.c,d:300\n" + field_list(rows) if rows else "no items"
+    return table(rows, fields.split(","))
+
+def search(words):
+    r = call("GET", "/store", search=" ".join(words), limit=10)["data"]["items"]
+    rows = [{"id": f"{x.get('username')}~{x.get('name')}", "title": x.get("title"), "users": (x.get("stats") or {}).get("totalUsers"),
+             "rating": x.get("actorReviewRating"), "pricing": cell(x.get("currentPricingInfo"), 90)} for x in r]
+    return table(rows, ["id:60", "title:60", "users", "rating", "pricing:90"])
+
+def schema(actor):
+    os.makedirs(CACHE, exist_ok=True); f = f"{CACHE}/{aid(actor)}.json"
+    if os.path.exists(f) and time.time() - os.path.getmtime(f) < 7 * 86400: s = json.load(open(f))
+    else:
+        act = call("GET", f"/acts/{aid(actor)}")["data"]
+        b = (act.get("taggedBuilds") or {}).get("latest", {}).get("buildId")
+        build = call("GET", f"/actor-builds/{b}")["data"] if b else {}
+        s = build.get("inputSchema") or (build.get("actorDefinition") or {}).get("input") or {}
+        s = json.loads(s) if isinstance(s, str) else s
+        if s: json.dump(s, open(f, "w"))  # an empty answer (no latest build) is not kept for 7 days
+    req = set(s.get("required", []))
+    rows = [{"name": k, "type": v.get("type"), "default": v.get("default", v.get("prefill")), "req": "yes" if k in req else "",
+             "title": v.get("title"), "enum": v.get("enum")} for k, v in (s.get("properties") or {}).items()]
+    return table(rows, ["name", "type", "default:60", "req", "title:70", "enum:80"])
+
+def run(a):
+    actor, src = a[0], a[1]
+    usd = opt(a, "--max-usd")
+    if usd is None: sys.exit("apify run: --max-usd is required (the most this run may cost)")
+    body = json.load(sys.stdin if src == "-" else open(src))
+    r = call("POST", f"/acts/{aid(actor)}/runs", body, maxTotalChargeUsd=usd, maxItems=opt(a, "--max-items"),
+             timeout=opt(a, "--timeout"))["data"]
+    t0 = time.time()
+    while r["status"] in ("READY", "RUNNING", "TIMING-OUT", "ABORTING"):
+        r = call("GET", f"/actor-runs/{r['id']}", waitForFinish=60)["data"]
+    count = call("GET", f"/datasets/{r['defaultDatasetId']}")["data"].get("itemCount")  # the run's stats.itemCount is empty
+    sys.stderr.write(f"run {r['id']} {r['status']} in {int(time.time() - t0)} s, cost ${r.get('usageTotalUsd') or 0:.4f}, "
+                     f"dataset {r['defaultDatasetId']}, {'?' if count is None else count} items\n")
+    return items(a[2:], r["defaultDatasetId"])
+
+def runs(a):
+    r = call("GET", "/actor-runs", desc=1, limit=int(opt(a, "--limit", 10)))["data"]["items"]
+    rows = [{"id": x["id"], "actor": x.get("actId"), "status": x.get("status"), "started": (x.get("startedAt") or "")[:16],
+             "usd": f"{x.get('usageTotalUsd') or 0:.4f}", "dataset": x.get("defaultDatasetId")} for x in r]
+    return table(rows, ["id", "actor", "status", "started", "usd", "dataset"])
+
+def self_test():
+    global call, CACHE
+    real = call; seen = []
+    def fake(method, path, body=None, **q):
+        seen.append((method, path, q))
+        if path == "/actor-runs/RUN1": return {"data": {"id": "RUN1", "status": "SUCCEEDED", "defaultDatasetId": "DS1", "usageTotalUsd": 0.01}}
+        if path.startswith("/actor-runs/"): raise SystemExit("404")
+        if path == "/acts/a~b/runs": return {"data": {"id": "RUN1", "status": "RUNNING", "defaultDatasetId": "DS1"}}
+        if path == "/datasets/DS1": return {"data": {"itemCount": 1}}
+        if path == "/acts/a~nobuild": return {"data": {}}
+        if path.endswith("/items"):
+            return [{"title": "Dev\tjob", "company": {"name": "X"}, "desc": "y" * 25000, "tags": ["a", "b"]}]
+        raise AssertionError(path)
+    call = fake
+    try:
+        out = items(["DS1", "--fields", "title,company.name,desc:10,tags"])
+        assert out.splitlines() == ["title\tcompany.name\tdesc:10\ttags".replace(":10", ""), "Dev job\tX\tyyyyyyyyy…\ta; b"], out
+        assert ("GET", "/datasets/DS1/items") in [(m, p) for m, p, _ in seen] and seen[-1][2]["fields"] == "company,desc,tags,title"
+        assert "avg" in items(["RUN1"]) and seen[-1][1] == "/datasets/DS1/items" and seen[-1][2]["limit"] == 20
+        assert len(json.loads(items(["DS1", "--json", "--limit", "5"]))[0]["desc"]) == 25000 and seen[-1][2]["limit"] == 5  # --json was cut at 20,000
+        err, sys.stderr = sys.stderr, __import__("io").StringIO()
+        try: run(["a/b", "-"]); raise AssertionError("ran without --max-usd")
+        except SystemExit as e: assert "max-usd" in str(e)
+        sys.stdin = __import__("io").StringIO("{}")
+        try: assert "Dev job" in run(["a/b", "-", "--max-usd", "0.5", "--fields", "title"])
+        finally: line, sys.stderr = sys.stderr.getvalue(), err
+        assert ", 1 items" in line, line  # the run line said "? items"
+        assert [s for s in seen if s[1] == "/acts/a~b/runs"][0][2]["maxTotalChargeUsd"] == "0.5"
+        cache, CACHE = CACHE, __import__("tempfile").mkdtemp()  # no empty schema in the cache
+        try: schema("a/nobuild"); assert not os.listdir(CACHE)
+        finally: __import__("shutil").rmtree(CACHE); CACHE = cache
+    finally:
+        call = real
+    # a GET survives a 502 and a read timeout; a POST is sent once
+    import io; tries = []; ro, rs, env = urllib.request.urlopen, time.sleep, os.environ.get("APIFY_TOKEN")
+    def fake_open(req, timeout):
+        tries.append(req.get_method())
+        if len(tries) == 1: raise urllib.error.HTTPError(req.full_url, 502, "Bad Gateway", {}, io.BytesIO(b"busy"))
+        if len(tries) == 2: raise TimeoutError("read timed out")
+        if req.get_method() == "POST": raise urllib.error.HTTPError(req.full_url, 502, "Bad Gateway", {}, io.BytesIO(b"busy"))
+        return io.BytesIO(b'{"data": 1}')
+    urllib.request.urlopen, time.sleep, os.environ["APIFY_TOKEN"] = fake_open, lambda s: None, "t"
+    try:
+        assert call("GET", "/x") == {"data": 1} and tries == ["GET"] * 3, tries
+        try: call("POST", "/acts/a~b/runs", {}); raise AssertionError("POST retried or passed")
+        except SystemExit as e: assert "502" in str(e) and tries.count("POST") == 1, tries
+    finally:
+        urllib.request.urlopen, time.sleep = ro, rs
+        if env is None: os.environ.pop("APIFY_TOKEN")
+        else: os.environ["APIFY_TOKEN"] = env
+    env = dict(os.environ); os.environ.pop("APIFY_TOKEN", None); os.environ.update(PATH="", HOME="/nonexistent")
+    try: token(); raise AssertionError("token() found a token")
+    except SystemExit as e: assert "No Apify token" in str(e), e  # without `security` on PATH: the README message, no traceback
+    finally: os.environ.clear(); os.environ.update(env)
+    print("apify self-test ok")
+
+def main(a):
+    if not a or a[0] in ("-h", "--help"): sys.exit(__doc__)
+    c, rest = a[0], a[1:]
+    if c == "--self-test": return self_test()
+    out = {"search": lambda: search(rest), "schema": lambda: schema(rest[0]), "run": lambda: run(rest),
+           "items": lambda: items(rest), "runs": lambda: runs(rest)}.get(c)
+    if not out: sys.exit(__doc__)
+    print(out())
+
+if __name__ == "__main__": main(sys.argv[1:])

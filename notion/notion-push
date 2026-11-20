@@ -1,0 +1,363 @@
+#!/usr/bin/env python3
+"""notion-push <file.md | -> <page id or URL> [--append | --replace] [--dry-run] [--self-test]
+Copy a local Markdown file into a Notion page (official REST API, stdlib only)."""
+import json, os, re, socket, subprocess, sys, tempfile, time, urllib.error, urllib.request
+
+_gai = socket.getaddrinfo  # IPv6 to api.notion.com timed out on this network (20 Nov 2026): try IPv4 first
+socket.getaddrinfo = lambda *a, **k: sorted(_gai(*a, **k), key=lambda x: x[0] != socket.AF_INET)
+
+API = "https://api.notion.com/v1"
+VERSION = "2022-06-28"  # stable; block endpoints are the same in later versions
+GAP = 0.34              # ~3 requests a second
+LANGS = set("""abap arduino bash basic c clojure coffeescript c++ c# css dart diff docker elixir elm erlang flow fortran f# gherkin glsl go graphql groovy haskell html java javascript json julia kotlin latex less lisp livescript lua makefile markdown markup matlab mermaid nix objective-c ocaml pascal perl php plain text powershell prolog protobuf python r reason ruby rust sass scala scheme scss shell sql swift typescript vb.net verilog vhdl visual basic webassembly xml yaml""".split())
+ALIAS = {"js": "javascript", "ts": "typescript", "sh": "shell", "zsh": "shell", "py": "python", "yml": "yaml",
+         "jsx": "javascript", "tsx": "typescript", "cpp": "c++", "cs": "c#", "rb": "ruby", "md": "markdown",
+         "html": "html", "tf": "plain text", "env": "plain text", "": "plain text"}
+LANGS |= {"plain text", "visual basic"}
+
+# ---------- inline ----------
+INL = re.compile(r"`([^`]+)`|\*\*(.+?)\*\*|__(.+?)__|\*(?!\s)(.+?)\*|(?<![\w])_(.+?)_(?![\w])|\[([^\]]+)\]\(([^)\s]+)\)|~~(.+?)~~")
+
+def chunks(text, ann, link):
+    # Notion's 2,000 counts UTF-16 units: an emoji outside the BMP is 2 (live 21 Nov 2026: 1,999 emoji + "a" was 3,999)
+    parts, start, n = [], 0, 0
+    for k, ch in enumerate(text):
+        w = 2 if ord(ch) > 0xFFFF else 1
+        if n + w > 2000: parts.append(text[start:k]); start, n = k, 0
+        n += w
+    if start < len(text): parts.append(text[start:])
+    out = []
+    for piece in parts:
+        t = {"content": piece}
+        if link: t["link"] = {"url": link}
+        o = {"type": "text", "text": t}
+        if ann: o["annotations"] = dict(ann)
+        out.append(o)
+    return out
+
+def rich(s, ann=None, link=None):
+    ann = ann or {}; out = []; pos = 0
+    for m in INL.finditer(s):
+        if m.start() > pos: out += chunks(s[pos:m.start()], ann, link)
+        pos = m.end(); g = m.groups()
+        if g[0] is not None: out += chunks(g[0], {**ann, "code": True}, link)
+        elif g[1] or g[2]: out += rich(g[1] or g[2], {**ann, "bold": True}, link)
+        elif g[3] or g[4]: out += rich(g[3] or g[4], {**ann, "italic": True}, link)
+        elif g[5]:
+            url = g[6]
+            out += rich(g[5], ann, url) if url.startswith(("http://", "https://", "mailto:")) else rich(g[5], ann, link)
+        elif g[7]: out += rich(g[7], {**ann, "strikethrough": True}, link)
+    if pos < len(s): out += chunks(s[pos:], ann, link)
+    return out
+
+def cap(r):
+    # Notion allows 100 rich_text items; the tail becomes plain text (loses its bold/links only), kept short enough
+    # that it and its 2,000-unit pieces fit in 100. ponytail: past ~200,000 characters one block cannot hold it
+    if len(r) <= 100: return r
+    for k in range(99, -1, -1):
+        tail = chunks("".join(x["text"]["content"] for x in r[k:]), None, None)
+        if k + len(tail) <= 100: break
+    return r[:k] + tail
+
+# ---------- blocks ----------
+def blk(t, text="", kids=None, **extra):
+    d = {"rich_text": cap(rich(text)), **extra}
+    if kids: d["children"] = kids
+    return {"object": "block", "type": t, t: d}
+
+def row_cells(line):
+    line = line.strip()
+    line = line[1:] if line.startswith("|") else line
+    line = line[:-1] if line.endswith("|") and not line.endswith("\\|") else line
+    return [c.strip().replace("\\|", "|") for c in re.split(r"(?<!\\)\|", line)]
+
+LIST = re.compile(r"^(\s*)([-*+]|\d+[.)])\s+(.*)$")
+SEP = re.compile(r"^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?\s*$")
+
+def list_item(marker, text, kids):
+    m = re.match(r"\[( |x|X)\]\s+(.*)", text)
+    if marker[0].isdigit(): return blk("numbered_list_item", text, kids)
+    if m: return blk("to_do", m.group(2), kids, checked=m.group(1) != " ")
+    return blk("bulleted_list_item", text, kids)
+
+def parse_list(lines, i):
+    """Consume list lines from i; return (blocks, next i). Nesting by indent."""
+    root = []; stack = [(-1, root)]; last = None
+    while i < len(lines):
+        ln = lines[i].expandtabs(4); m = LIST.match(ln)
+        if m:
+            ind = len(m.group(1))
+            while stack[-1][0] >= ind: stack.pop()
+            item = {"marker": m.group(2), "text": m.group(3), "kids": []}
+            stack[-1][1].append(item); stack.append((ind, item["kids"])); last = item
+        elif ln.strip() and last and ln.startswith(" ") and not ln.lstrip().startswith(("```", ">", "|")):
+            last["text"] += " " + ln.strip()
+        else: break
+        i += 1
+    def build(items): return [list_item(x["marker"], x["text"], build(x["kids"])) for x in items]
+    return build(root), i
+
+CALLOUT_COLOR = {"📍": "blue_background", "✅": "green_background", "❓": "yellow_background", "⚠️": "red_background", "⚠": "red_background"}
+
+def indented(lines, i):
+    """Lines from i indented by 2+ spaces (blank lines between allowed), dedented; returns (text, next i)."""
+    body = []
+    while i < len(lines):
+        if lines[i].startswith("  "): body.append(lines[i][2:]); i += 1
+        elif not lines[i].strip() and i + 1 < len(lines) and lines[i + 1].startswith("  "): body.append(""); i += 1
+        else: break
+    return "\n".join(body), i
+
+def is_callout(s): return s.startswith("> ") and len(s) > 2 and ord(s[2]) >= 0x2190 and not s[2].isalnum()
+
+def convert(md):
+    lines = md.replace("\r\n", "\n").split("\n"); out = []; i = 0
+    while i < len(lines):
+        ln = lines[i]; s = ln.strip()
+        if not s: i += 1; continue
+        m = re.match(r"^\s*(```|~~~)\s*([\w+#.-]*)", ln)
+        if m:
+            fence, lang = m.group(1), m.group(2).lower(); i += 1; body = []
+            while i < len(lines) and not lines[i].strip().startswith(fence): body.append(lines[i]); i += 1
+            i += 1; lang = ALIAS.get(lang, lang); lang = lang if lang in LANGS else "plain text"
+            out.append({"object": "block", "type": "code", "code": {"rich_text": chunks("\n".join(body), None, None) or chunks(" ", None, None), "language": lang}})
+        elif re.match(r"^#{1,}\s", s):
+            n = min(len(s) - len(s.lstrip("#")), 3); sub, j = indented(lines, i + 1)
+            if sub.strip(): out.append(blk(f"heading_{n}", s.lstrip("#").strip(), convert(sub), is_toggleable=True)); i = j
+            else: out.append(blk(f"heading_{n}", s.lstrip("#").strip())); i += 1
+        elif s.startswith("▸ ") or is_callout(s):
+            sub, i = indented(lines, i + 1); kids = convert(sub)
+            if s.startswith("▸"): out.append(blk("toggle", s[2:].strip(), kids))
+            else:
+                icon, _, title = s[2:].partition(" ")
+                out.append(blk("callout", title.strip(), kids, icon={"type": "emoji", "emoji": icon}, color=CALLOUT_COLOR.get(icon, "gray_background")))
+        elif re.match(r"^([-*_])(\s*\1){2,}$", s):
+            out.append({"object": "block", "type": "divider", "divider": {}}); i += 1
+        elif s.startswith("|") and i + 1 < len(lines) and SEP.match(lines[i + 1]):
+            hdr = row_cells(s); w = len(hdr); i += 2; rows = [hdr]
+            while i < len(lines) and lines[i].strip().startswith("|"): rows.append(row_cells(lines[i])); i += 1
+            kids = [{"object": "block", "type": "table_row", "table_row": {"cells": [cap(rich(c)) for c in (r + [""] * w)[:w]]}} for r in rows]
+            out.append({"object": "block", "type": "table", "table": {"table_width": w, "has_column_header": True, "has_row_header": False, "children": kids}})
+        elif s.startswith(">"):
+            q = []
+            while i < len(lines) and lines[i].strip().startswith(">"): q.append(re.sub(r"^\s*>\s?", "", lines[i])); i += 1
+            out.append(blk("quote", "\n".join(q)))
+        elif LIST.match(ln):
+            b, i = parse_list(lines, i); out += b
+        else:
+            p = [s]; i += 1
+            while i < len(lines) and lines[i].strip() and not re.match(r"^\s*(```|~~~|#|>|▸ |\||([-*_])(\s*\2){2,}$)", lines[i]) and not LIST.match(lines[i]):
+                p.append(lines[i].strip()); i += 1
+            out.append(blk("paragraph", " ".join(p)))
+    return out
+
+# ---------- sending ----------
+def kids(b): return b[b["type"]].get("children", [])
+def depth(b): return 1 + max(map(depth, kids(b))) if kids(b) else 0
+def count(b): return 1 + sum(map(count, kids(b)))
+
+def plan(blocks):
+    """Batches of top-level blocks: <=100, <=900 blocks total, <=400 KB."""
+    batch, n, size = [], 0, 0
+    for b in blocks:
+        c, z = count(b), len(json.dumps(b))
+        if batch and (len(batch) >= 100 or n + c > 900 or size + z > 400_000): yield batch; batch, n, size = [], 0, 0
+        batch.append(b); n += c; size += z
+    if batch: yield batch
+
+class Client:
+    def __init__(self, token, dry):
+        self.token, self.dry, self.n, self.last, self.fake = token, dry, 0, 0.0, 0
+    def call(self, method, path, body=None, version=VERSION):
+        self.n += 1
+        if self.n % 10 == 0 and not getattr(self, "quiet", False): print(f"  {self.n} requests...", file=sys.stderr)
+        if self.dry:
+            if method == "PATCH": self.fake += 1; return {"results": [{"id": f"x{self.fake}-{k}"} for k in range(len(body["children"]))]}
+            return {}
+        data = json.dumps(body).encode() if body is not None else None
+        for attempt in range(5):
+            wait = GAP - (time.time() - self.last)
+            if wait > 0: time.sleep(wait)
+            self.last = time.time()
+            req = urllib.request.Request(API + path, data=data, method=method, headers={
+                "Authorization": "Bearer " + self.token, "Notion-Version": version, "Content-Type": "application/json"})
+            try:
+                with urllib.request.urlopen(req, timeout=60) as r: return json.load(r)
+            except urllib.error.HTTPError as e:
+                if (e.code in (409, 429) or e.code >= 500) and attempt < 4:  # 409: Notion's retryable conflict_error
+                    time.sleep(float(e.headers.get("Retry-After") or 2 ** attempt)); continue
+                sys.exit(f"Notion {e.code} on {method} {path}: {e.read().decode()[:300]}")
+            except OSError as e:  # URLError, and the read timeouts and resets that urlopen does not wrap
+                if attempt == 4: sys.exit(f"network error on {method} {path}: {getattr(e, 'reason', e)}")
+                time.sleep(2 ** attempt)
+
+def send(c, parent, blocks, after=None, start=False):
+    """Append blocks under parent (after block `after`, or first when start). Blocks nested deeper than 1 level, or with
+    over 100 children (Notion's cap for every children array), are sent bare and their children follow; a table, which
+    needs rows at creation, keeps its first 100."""
+    for batch in plan(blocks):
+        flat, later = [], {}
+        for k, b in enumerate(batch):
+            ks = kids(b)
+            if depth(b) >= 2 or len(ks) > 100:
+                t = b["type"]; keep = ks[:100] if t == "table" else []; later[k] = ks[len(keep):]
+                b = {**b, t: {**{x: y for x, y in b[t].items() if x != "children"}, **({"children": keep} if keep else {})}}
+            flat.append(b)
+        body, v = {"children": flat}, VERSION
+        if after: body["after"] = after
+        elif start: body["position"], v = {"type": "start"}, "2025-09-03"
+        res = c.call("PATCH", f"/blocks/{parent}/children", body, v)["results"]
+        if after or start: after, start = res[len(flat) - 1]["id"], False
+        for k, ch in later.items(): send(c, res[k]["id"], ch)
+
+def child_ids(c, page):
+    ids, cur = [], None
+    while True:
+        r = c.call("GET", f"/blocks/{page}/children?page_size=100" + (f"&start_cursor={cur}" if cur else ""))
+        ids += [b["id"] for b in r["results"]]
+        if not r.get("has_more"): break
+        cur = r["next_cursor"]
+    return ids
+
+def push(c, page, blocks, replace):
+    """--replace lists the old blocks first and deletes them only after the new ones are in: a failed write loses nothing."""
+    old = child_ids(c, page) if replace else []
+    send(c, page, blocks)
+    for i in old: c.call("DELETE", f"/blocks/{i}")
+    return len(old)
+
+def token():
+    t = os.environ.get("NOTION_TOKEN")
+    if not t:
+        try:
+            r = subprocess.run(["security", "find-generic-password", "-s", "notion-api", "-w"], capture_output=True, text=True)
+            t = r.stdout.strip() if r.returncode == 0 else ""
+        except FileNotFoundError:  # no keychain tool (Linux)
+            t = ""
+    if not t:
+        sys.stderr.write("No Notion token. Create an internal integration at notion.so/profile/integrations, share the target page with it "
+                         "(page's ... menu -> Connections), then store the token with: security add-generic-password -a \"$USER\" -s notion-api -w "
+                         "(or export NOTION_TOKEN).\n"); sys.exit(2)
+    return t
+
+def page_id(s):
+    """An ID, dashed or not, or a URL: its ?p= (a page opened over a database), else the last ID in its path, never ?v= (a view).
+    The ID must stand alone: in .../Decisions-20-Nov-2026-<id> the old dash-stripping search read 2026 as part of it."""
+    q = re.search(r"[?&]p=([0-9a-fA-F]{32})", s)
+    h = [q.group(1)] if q else re.findall(r"(?<![0-9a-fA-F])[0-9a-fA-F]{8}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{12}(?![0-9a-fA-F])", s.split("?")[0])
+    if not h: sys.exit("no page id found in: " + s)
+    return h[-1].replace("-", "")
+
+# ---------- self-test ----------
+SAMPLE = """# One
+## Two
+### Three
+#### Four
+Para with **bold**, *ital*, `code` and [a link](https://x.io/a).
+second line.
+
+- a
+  - a1
+    - a1x
+- [ ] todo
+- [x] done
+1. first
+2. second
+
+```js
+const x = 1;
+```
+```weirdlang
+y
+```
+> quoted
+> more
+
+---
+
+| H1 | H2 |
+|----|:--:|
+| a | **b** |
+| c |
+""" + "L" * 4500 + "\n"
+
+def self_test():
+    b = convert(SAMPLE); ty = [x["type"] for x in b]
+    assert ty == ["heading_1", "heading_2", "heading_3", "heading_3", "paragraph", "bulleted_list_item", "to_do", "to_do",
+                  "numbered_list_item", "numbered_list_item", "code", "code", "quote", "divider", "table", "paragraph"], ty
+    rt = b[4]["paragraph"]["rich_text"]
+    assert [r["text"]["content"] for r in rt][1] == "bold" and rt[1]["annotations"]["bold"] and rt[3]["annotations"]["italic"]
+    assert rt[5]["annotations"]["code"] and rt[7]["text"]["link"]["url"] == "https://x.io/a" and rt[-1]["text"]["content"].endswith("second line.")
+    l1 = b[5]["bulleted_list_item"]["children"][0]; assert l1["bulleted_list_item"]["children"][0]["bulleted_list_item"]["rich_text"][0]["text"]["content"] == "a1x"
+    assert b[6]["to_do"]["checked"] is False and b[7]["to_do"]["checked"] is True
+    assert b[10]["code"]["language"] == "javascript" and b[11]["code"]["language"] == "plain text"
+    t = b[14]["table"]; assert t["table_width"] == 2 and t["has_column_header"] and len(t["children"]) == 3
+    assert all(len(r["table_row"]["cells"]) == 2 for r in t["children"])
+    p = b[15]["paragraph"]["rich_text"]; assert [len(r["text"]["content"]) for r in p] == [2000, 2000, 500]
+    # planner: deep nesting is deferred, 250 blocks -> 3 batches
+    c = Client("", True); send(c, "root", b); assert c.n == 2  # root batch + deferred children of the 3-level bullet
+    c = Client("", True); send(c, "root", [blk("paragraph", str(i)) for i in range(250)]); assert c.n == 3
+    b2 = convert("> 📍 Current state – 20 Nov\n  - one\n  - two\n▸ History\n  - h1\n\n  - h2\n## Tog\n  inside\nafter\n> plain quote")
+    assert [x["type"] for x in b2] == ["callout", "toggle", "heading_2", "paragraph", "quote"], [x["type"] for x in b2]
+    assert b2[0]["callout"]["icon"]["emoji"] == "📍" and b2[0]["callout"]["color"] == "blue_background" and len(b2[0]["callout"]["children"]) == 2
+    assert len(b2[1]["toggle"]["children"]) == 2 and b2[2]["heading_2"]["is_toggleable"] and b2[3]["paragraph"]["rich_text"][0]["text"]["content"] == "after"
+    # review 21 Nov 2026: the 2,000 limit counts UTF-16 units; cap keeps 100 items in paragraphs and table cells
+    e = chunks("😀" * 1999 + "a", None, None)
+    assert "".join(x["text"]["content"] for x in e) == "😀" * 1999 + "a" and max(len(x["text"]["content"].encode("utf-16-le")) // 2 for x in e) <= 2000
+    r = cap(rich("**b** " * 150 + "L" * 4500)); assert len(r) <= 100 and "".join(x["text"]["content"] for x in r) == "b " * 150 + "L" * 4500
+    assert len(convert("| h |\n|---|\n| " + "**b** " * 150 + "|")[0]["table"]["children"][1]["table_row"]["cells"][0]) <= 100
+    # a 150-row table and a 150-item toggle: no children array over 100 in any request, nothing dropped
+    c = Client("", True); bodies = []; real = c.call
+    c.call = lambda m, p, body=None, v=VERSION: (bodies.append(body), real(m, p, body, v))[1]
+    send(c, "root", convert("| n |\n|---|\n" + "\n".join(f"| {i} |" for i in range(149))) + convert("▸ T\n" + "\n".join(f"  - {i}" for i in range(150))))
+    widest = lambda bs: max([len(bs)] + [widest(kids(x)) for x in bs])
+    assert max(widest(x["children"]) for x in bodies) <= 100 and [len(x["children"]) for x in bodies] == [2, 50, 100, 50], [len(x["children"]) for x in bodies]
+    # --replace writes before it deletes
+    log = []; c = Client("", True); real = c.call
+    c.call = lambda m, p, body=None, v=VERSION: (log.append(m), {"results": [{"id": "old"}]} if m == "GET" else real(m, p, body, v))[1]
+    assert push(c, "pg", [blk("paragraph", "new")], True) == 1 and log == ["GET", "PATCH", "DELETE"], log
+    # IDs in URLs: a title ending in hex or a year, a view, a peeked page
+    i = "0123456789abcdef0123456789abcdef"
+    assert page_id(f"https://www.notion.so/Decisions-20-Nov-2026-{i}") == i and page_id(f"https://www.notion.so/Add-a-cafe-{i}") == i
+    assert page_id(f"https://www.notion.so/{i}?v={'2' * 32}") == i and page_id(f"x/{'0' * 32}?v={'1' * 32}&p={i}") == i
+    assert page_id("01234567-89ab-cdef-0123-456789abcdef") == i
+    # a read timeout (not wrapped in URLError) is retried
+    seq, ro, rs = [TimeoutError("read timed out"), None], urllib.request.urlopen, time.sleep
+    def fake_open(req, timeout):
+        x = seq.pop(0)
+        if x: raise x
+        return __import__("io").BytesIO(b'{"ok": 1}')
+    urllib.request.urlopen, time.sleep = fake_open, lambda s: None
+    try: assert Client("t", False).call("GET", "/x") == {"ok": 1}
+    finally: urllib.request.urlopen, time.sleep = ro, rs
+    try: main(["/nonexistent.md", "0" * 32, "--replce"]); raise AssertionError("unknown flag accepted")
+    except SystemExit as e: assert "notion-push" in str(e)
+    env = dict(os.environ); os.environ.pop("NOTION_TOKEN", None); os.environ["PATH"] = ""; err, sys.stderr = sys.stderr, __import__("io").StringIO()
+    try: token(); raise AssertionError("token() found a token")
+    except SystemExit as e: assert e.code == 2 and "No Notion token" in sys.stderr.getvalue()  # without `security` on PATH: the README message, no traceback
+    finally: os.environ.clear(); os.environ.update(env); sys.stderr = err
+    print("self-test ok: %d blocks, types/nesting/table/split, UTF-16 split, caps, 100-children, replace order, URL ids, retry" % len(b))
+
+# ---------- main ----------
+def main(a):
+    flags = {x for x in a if x.startswith("--")}; pos = [x for x in a if not x.startswith("--")]
+    if "--self-test" in flags:
+        self_test()
+        return
+    if len(pos) != 2 or flags - {"--append", "--replace", "--dry-run"}: sys.exit(__doc__)  # a mistyped --replace must not append
+    run(pos[0], page_id(pos[1]), "--dry-run" in flags, "--replace" in flags)
+
+def run(path, page, dry, replace):
+    t0 = time.time(); blocks = convert(sys.stdin.read() if path == "-" else open(path, encoding="utf-8").read()); conv = time.time() - t0
+    c = Client("" if dry else token(), dry)
+    if dry:
+        send(c, page, blocks)
+        d = tempfile.mkdtemp(prefix="notion-push-"); out = os.path.join(d, os.path.basename(path) + ".blocks.json")
+        json.dump(blocks, open(out, "w"))
+        print(f"{sum(map(count, blocks))} blocks ({len(blocks)} top-level), {c.n} requests, ~{c.n * GAP / 60:.1f} min"
+              f"{' (+1 list and 1 delete per existing block for --replace)' if replace else ''}; converted in {conv:.2f}s; JSON: {out}")
+        return
+    gone = push(c, page, blocks, replace)
+    print(f"done: {sum(map(count, blocks))} blocks in {c.n} requests" + (f", then deleted the {gone} old blocks" if replace else ""))
+
+if __name__ == "__main__": main(sys.argv[1:])

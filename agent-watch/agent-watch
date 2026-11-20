@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# agent-watch [--once] <session subagents dir> [minutes]: start once per session with
+# run_in_background, in the same message as the first Agent spawn (placed before it), so it costs
+# no extra call. A stuck agent sends nothing, and an idle main thread wakes only when a background
+# task exits, so this exits on the first agent whose transcript has been silent for <minutes>
+# (default 30) while its meta file says unfinished. It never exits just because every agent is
+# done (that exit would cost a wake-up, ~220k input tokens); it ends when the session's own
+# transcript has been silent 12 h. --once prints stuck agents now and exits.
+# Threshold from 400 agent transcripts: a running agent's longest silence was at
+# most 18 min for a model reply and 4 min for a tool at p99; longer gaps were finished agents
+# resumed later. Test: tests/agent-watch.test.sh. macOS only (BSD stat).
+set -u
+once=0; [ "${1:-}" = --once ] && { once=1; shift; }
+dir=$1; min=${2:-30}; poll=${AGENT_WATCH_POLL:-60}
+main="${dir%/subagents}.jsonl"
+while :; do
+  now=$(date +%s); stuck=""
+  for m in "$dir"/agent-*.meta.json; do
+    [ -f "$m" ] || continue
+    [ "$(jq -r '.finished // false' "$m")" = true ] && continue
+    j=${m%.meta.json}.jsonl
+    [ -f "$j" ] || continue
+    age=$(( (now - $(stat -f %m "$j")) / 60 ))
+    [ "$age" -gt 720 ] && continue # dead in an earlier run of this session, not running now
+    [ "$age" -ge "$min" ] && stuck="$stuck
+$(basename "$j" .jsonl | sed 's/^agent-//') $(jq -r '"\(.agentType) \"\(.description)\""' "$m"): silent $age min; transcript $j"
+  done
+  if [ -n "$stuck" ]; then
+    echo "Possibly stuck (no transcript write for $min+ min):$stuck"
+    [ "$once" = 1 ] && exit 1
+    echo "Read the transcript tail, then TaskStop and re-spawn with its state, or tell the user. Then start agent-watch again."
+    exit 1
+  fi
+  [ "$once" = 1 ] && exit 0
+  [ -f "$main" ] && [ $((now - $(stat -f %m "$main"))) -gt 43200 ] && exit 0 # session over
+  sleep "$poll"
+done
