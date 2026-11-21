@@ -15,6 +15,8 @@ The two skills load in Claude Code, Cowork and chat on claude.ai. The `worker` a
 - `notion-task-pages` holds rules only. Claude writes the page through the Notion tools you already have, so the page goes to your own Notion workspace and nowhere else.
 - `plain-prose` reads the file you ask it to edit. This version has no checker script: Claude re-reads the file against the rules.
 - `worker` runs the commands its task needs in your project, such as tests and builds, within the permissions you have set. It cannot start other agents or ask you questions.
+- `worker` can search the web and open pages with Claude's built-in web tools. The search query is built from its task.
+- Files `worker` reads can hold personal data, such as names and emails in fixtures or exports. It uses that data only in the session and stores none of it.
 - The plugin has no server and no telemetry. Nothing goes to its author.
 
 ## Examples
