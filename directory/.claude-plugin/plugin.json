@@ -1,6 +1,6 @@
 {
   "name": "session-toolkit",
-  "version": "0.3.3",
+  "version": "0.3.4",
   "description": "Two skills (Notion task pages, plain prose) and a worker agent for Claude Code. The full toolkit, with the audit skills and the command-line tools, installs from the repo's own marketplace.",
   "author": {
     "name": "mkhinini-motaz",

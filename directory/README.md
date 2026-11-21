@@ -34,6 +34,10 @@ Install it from the plugin directory once it is listed. For the full set, which 
 
 Source and issues: https://github.com/mkhinini-motaz/claude-code-session-toolkit. MIT license.
 
+## Privacy
+
+[Privacy policy](https://github.com/mkhinini-motaz/claude-code-session-toolkit/blob/main/PRIVACY.md): the author runs no server and collects no data.
+
 ## Support
 
 Questions and bugs: open an issue at https://github.com/mkhinini-motaz/claude-code-session-toolkit/issues. Security problems: report them privately from the repository's Security tab (private vulnerability reporting), not in a public issue.
