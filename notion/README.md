@@ -34,9 +34,9 @@ The scripts read the token in-process and never print it.
 
 `notion-push` converts Markdown to Notion blocks: headings, lists, to-dos, tables, code, quotes, dividers, callouts (`> 📍 text`) and toggles (`▸ text`), sent in batches of 100 blocks. Tables, toggles and lists over 100 items also go in batches of 100. Text is split by Notion's own length count (an emoji counts 2). `notion-push` flags are checked: an unknown one stops with usage instead of appending.
 
-`notion put` and `notion-push --replace` write the new blocks first and delete the old ones after, so a refused write loses nothing. Page IDs and URLs are accepted, including a URL that ends in a year or `?v=`. Requests are retried on timeouts, resets, 409, 429 and 5xx, writes included: if a timeout hits after Notion applied an append, check the page before rerunning.
+`notion put` and `notion-push --replace` write the new blocks first and delete the old ones after, so a refused write loses nothing. Page IDs and URLs are accepted, including a URL that ends in a year or `?v=`. A 409, a 429 or a failure to connect is retried for every request. A 5xx, a timeout or a reset after sending is retried only for reads: a write stops with a note to check the page, because it may have landed.
 
-Known gaps in this version: `notion` keeps an unknown `--flag` as a positional argument (`notion trash <id> --dry-run` trashes the page), and `notion put <id> <part>` with no file and empty input clears the part. Pass the file or `-` every time.
+`notion` refuses an unknown `--flag` before sending anything. `notion put` refuses an empty body; pass `--empty` to clear a part on purpose.
 
 ## IPv4 first
 

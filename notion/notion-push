@@ -52,7 +52,7 @@ def rich(s, ann=None, link=None):
 
 def cap(r):
     # Notion allows 100 rich_text items; the tail becomes plain text (loses its bold/links only), kept short enough
-    # that it and its 2,000-unit pieces fit in 100. ponytail: past ~200,000 characters one block cannot hold it
+    # that it and its 2,000-unit pieces fit in 100. Limit: past ~200,000 characters one block cannot hold it
     if len(r) <= 100: return r
     for k in range(99, -1, -1):
         tail = chunks("".join(x["text"]["content"] for x in r[k:]), None, None)
@@ -183,12 +183,20 @@ class Client:
                 "Authorization": "Bearer " + self.token, "Notion-Version": version, "Content-Type": "application/json"})
             try:
                 with urllib.request.urlopen(req, timeout=60) as r: return json.load(r)
+            # a retried PATCH or POST can land twice (an append doubles its blocks), so only what Notion
+            # refused (409 conflict_error, 429) or what never left (URLError) retries for every method; a 5xx or a
+            # timeout after sending retries only a GET
             except urllib.error.HTTPError as e:
-                if (e.code in (409, 429) or e.code >= 500) and attempt < 4:  # 409: Notion's retryable conflict_error
+                if (e.code in (409, 429) or (e.code >= 500 and method == "GET")) and attempt < 4:
                     time.sleep(float(e.headers.get("Retry-After") or 2 ** attempt)); continue
-                sys.exit(f"Notion {e.code} on {method} {path}: {e.read().decode()[:300]}")
-            except OSError as e:  # URLError, and the read timeouts and resets that urlopen does not wrap
-                if attempt == 4: sys.exit(f"network error on {method} {path}: {getattr(e, 'reason', e)}")
+                sys.exit(f"Notion {e.code} on {method} {path}: {e.read().decode()[:300]}"
+                         + ("" if e.code < 500 or method == "GET" else " (not retried: the write may have landed; check the page)"))
+            except urllib.error.URLError as e:  # urlopen wraps only connecting and sending: nothing reached Notion
+                if attempt == 4: sys.exit(f"network error on {method} {path}: {e.reason}")
+                time.sleep(2 ** attempt)
+            except OSError as e:  # a read timeout or reset once the request was sent, which urlopen does not wrap
+                if method != "GET": sys.exit(f"network error on {method} {path}: {e} (not retried: the write may have landed; check the page)")
+                if attempt == 4: sys.exit(f"network error on {method} {path}: {e}")
                 time.sleep(2 ** attempt)
 
 def send(c, parent, blocks, after=None, start=False):
@@ -301,7 +309,7 @@ def self_test():
     assert [x["type"] for x in b2] == ["callout", "toggle", "heading_2", "paragraph", "quote"], [x["type"] for x in b2]
     assert b2[0]["callout"]["icon"]["emoji"] == "📍" and b2[0]["callout"]["color"] == "blue_background" and len(b2[0]["callout"]["children"]) == 2
     assert len(b2[1]["toggle"]["children"]) == 2 and b2[2]["heading_2"]["is_toggleable"] and b2[3]["paragraph"]["rich_text"][0]["text"]["content"] == "after"
-    # review 21 Nov 2026: the 2,000 limit counts UTF-16 units; cap keeps 100 items in paragraphs and table cells
+    # the 2,000 limit counts UTF-16 units; cap keeps 100 items in paragraphs and table cells
     e = chunks("😀" * 1999 + "a", None, None)
     assert "".join(x["text"]["content"] for x in e) == "😀" * 1999 + "a" and max(len(x["text"]["content"].encode("utf-16-le")) // 2 for x in e) <= 2000
     r = cap(rich("**b** " * 150 + "L" * 4500)); assert len(r) <= 100 and "".join(x["text"]["content"] for x in r) == "b " * 150 + "L" * 4500
@@ -328,7 +336,15 @@ def self_test():
         if x: raise x
         return __import__("io").BytesIO(b'{"ok": 1}')
     urllib.request.urlopen, time.sleep = fake_open, lambda s: None
-    try: assert Client("t", False).call("GET", "/x") == {"ok": 1}
+    try:
+        assert Client("t", False).call("GET", "/x") == {"ok": 1}
+        # a write is retried only when nothing reached Notion: a URLError yes, a read timeout or a 502 no
+        seq = [urllib.error.URLError(ConnectionRefusedError()), None]
+        assert Client("t", False).call("PATCH", "/x", {}) == {"ok": 1} and not seq
+        for err in (TimeoutError("read timed out"), urllib.error.HTTPError("u", 502, "Bad Gateway", {}, __import__("io").BytesIO(b"x"))):
+            seq = [err, None]
+            try: Client("t", False).call("PATCH", "/x", {}); raise AssertionError(f"PATCH retried after {err!r}")
+            except SystemExit as e: assert "not retried" in str(e) and seq == [None], (e, seq)
     finally: urllib.request.urlopen, time.sleep = ro, rs
     try: main(["/nonexistent.md", "0" * 32, "--replce"]); raise AssertionError("unknown flag accepted")
     except SystemExit as e: assert "notion-push" in str(e)

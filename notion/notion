@@ -5,8 +5,9 @@
                                                  or toggle; NAME is any piece of its text. --props: properties only
   notion set <page> Name=Value ...               change properties; multi-select, relation and people take comma lists,
                                                  a date takes 2026-11-20 or 2026-11-20..2026-11-22, an empty value clears
-  notion put <page> NAME [file|-]                replace a part's body with Markdown (stdin when no file); a first line
-                                                 "= text" renames the part's heading, callout or toggle
+  notion put <page> NAME [file|-] [--empty]      replace a part's body with Markdown (stdin when no file); a first line
+                                                 "= text" renames the part's heading, callout or toggle. An empty body
+                                                 is refused unless --empty (which clears the part)
   notion add <page> NAME [file|-]                insert Markdown at the top of a part (a History toggle is newest first)
   notion query <database> [Prop=V | Prop!=V]... [--cols A,B]   rows as TSV. = means equals (contains for text,
                                                  multi-select, relation); an empty V tests for empty; filters are ANDed
@@ -20,7 +21,7 @@ Markdown also takes "> 📍 title" (a callout: 📍 blue, ✅ green, ❓ yellow,
 its content indented two spaces below; `get` prints pages in the same form, so a part can be read, edited and put back.
   notion --self-test
 <page> and <database> take an ID or a notion.so URL. Every write prints what it changed as it now stands.
-The integration sees only pages shared with it Comments, views, history and full-text search are not covered."""
+The integration sees only pages shared with it. Comments, views, history and full-text search are not covered."""
 import importlib.machinery, importlib.util, os, re, sys
 
 _p = os.path.join(os.path.dirname(os.path.realpath(__file__)), "notion-push")
@@ -173,12 +174,15 @@ def source(rest):
     if rest and rest[0] != "-": return open(rest[0], encoding="utf-8").read()
     return sys.stdin.read()
 
-def write(c, pid, name, md, mode):
-    top = children(c, pid); i, j, cont = find(top, name); b = top[i]; t = b["type"]
+def write(c, pid, name, md, mode, empty=False):
     lines = md.strip("\n").split("\n")
-    if mode == "put" and lines and lines[0].startswith("= "):
-        c.call("PATCH", f"/blocks/{b['id']}", {t: {"rich_text": np.cap(np.rich(lines[0][2:].strip()))}}); lines = lines[1:]
-    blocks = np.convert("\n".join(lines))
+    rename = mode == "put" and lines[0].startswith("= ")
+    blocks = np.convert("\n".join(lines[1:] if rename else lines))
+    # a put with no body (empty stdin, an empty file) deleted the part's whole body
+    if mode == "put" and not blocks and not empty:
+        sys.exit("put: no body given, which would delete the part's whole body; pass --empty to clear it on purpose")
+    top = children(c, pid); i, j, cont = find(top, name); b = top[i]; t = b["type"]
+    if rename: c.call("PATCH", f"/blocks/{b['id']}", {t: {"rich_text": np.cap(np.rich(lines[0][2:].strip()))}})
     # put: the old body goes only once the new one is in, so a refused write (a 400) loses nothing
     old = (children(c, b["id"]) if cont else top[i + 1:j]) if mode == "put" else []
     if blocks:
@@ -304,7 +308,7 @@ def self_test():
     assert value("multi_select", "a, b") == [{"name": "a"}, {"name": "b"}] and value("rich_text", "**x**")[0]["annotations"]["bold"]
     md2 = "> 📍 Current state – 20 Nov 2026\n  - one **b**\n▸ History\n  - 20 Nov: two\n> ❓\n  - None yet."
     assert render(api(np.convert(md2))) == md2.split("\n"), render(api(np.convert(md2)))
-    # review 21 Nov 2026: a put that Notion refuses deletes nothing, and a put that renames its part still prints it
+    # a put that Notion refuses deletes nothing, and a put that renames its part still prints it
     class Fake:
         def __init__(s, fail): s.fail, s.log, s.top = fail, [], api(np.convert("## Part\nold\n## End"))
         def call(s, m, path, body=None, v=None):
@@ -324,7 +328,19 @@ def self_test():
     for n, x in enumerate(f.top): x["id"] = f"b{n}"
     with __import__("contextlib").redirect_stdout(out): write(f, "pg", "Part", "= Renamed\nnew", "put")
     assert out.getvalue().startswith("## Renamed") and [m for m, _ in f.log].index("DELETE") > f.log.index(("PATCH", "/blocks/pg/children")), f.log
-    print("self-test ok: render round trip, part bounds, filters, property values, put order and rename")
+    # an empty put sends nothing unless --empty; an unknown flag stops before any request
+    for body in ("", "\n\n", "= Renamed\n"):
+        f = Fake(False)
+        try: write(f, "pg", "Part", body, "put"); raise AssertionError(f"empty put {body!r} accepted")
+        except SystemExit as e: assert "--empty" in str(e) and not f.log, f.log
+    f = Fake(False)
+    for n, x in enumerate(f.top): x["id"] = f"b{n}"
+    with __import__("contextlib").redirect_stdout(__import__("io").StringIO()): write(f, "pg", "Part", "", "put", empty=True)
+    assert [m for m, _ in f.log].count("DELETE") == 1, f.log
+    for argv in (["trash", "0" * 32, "--dry-run"], ["put", "0" * 32, "Part", "--emtpy"]):
+        try: main(argv); raise AssertionError(f"unknown flag accepted: {argv}")
+        except SystemExit as e: assert "unknown flag" in str(e), e
+    print("self-test ok: render round trip, part bounds, filters, property values, put order and rename, empty put, unknown flags")
 
 # ---------- main ----------
 def main(a):
@@ -333,7 +349,11 @@ def main(a):
     cmd, rest = a[0], a[1:]
     parts = [rest[i + 1] for i, x in enumerate(rest) if x == "--part" and i + 1 < len(rest)]
     cols = next((rest[i + 1].split(",") for i, x in enumerate(rest) if x == "--cols" and i + 1 < len(rest)), None)
-    pos = [x for i, x in enumerate(rest) if x not in ("--part", "--cols", "--props") and (i == 0 or rest[i - 1] not in ("--part", "--cols"))]
+    flag = lambda i, x: x.startswith("--") and (i == 0 or rest[i - 1] not in ("--part", "--cols"))
+    # an unknown flag was a positional, so `trash <id> --dry-run` really trashed the page
+    bad = [x for i, x in enumerate(rest) if flag(i, x) and x not in ("--part", "--cols", "--props", "--empty")]
+    if bad: sys.exit(f"unknown flag {bad[0]}: notion takes --part, --cols, --props and --empty (put); nothing was sent")
+    pos = [x for i, x in enumerate(rest) if not flag(i, x) and (i == 0 or rest[i - 1] not in ("--part", "--cols"))]
     if not pos: sys.exit(__doc__)
     c = np.Client(np.token(), False); c.quiet = True
     if cmd == "search": return search(c, " ".join(pos))
@@ -344,7 +364,7 @@ def main(a):
     if cmd == "edit" and len(pos) == 3: return edit(c, pid, pos[1], pos[2])
     if cmd == "get": get(c, pid, parts, "--props" in rest)
     elif cmd == "set" and len(pos) > 1: setp(c, pid, pos[1:])
-    elif cmd in ("put", "add") and len(pos) > 1: write(c, pid, pos[1], source(pos[2:]), cmd)
+    elif cmd in ("put", "add") and len(pos) > 1: write(c, pid, pos[1], source(pos[2:]), cmd, "--empty" in rest)
     elif cmd == "query": query(c, pid, pos[1:], cols)
     elif cmd == "trash": c.call("PATCH", f"/pages/{pid}", {"archived": True}); print("trashed", pid)
     else: sys.exit(__doc__)
