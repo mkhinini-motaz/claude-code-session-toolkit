@@ -33,6 +33,8 @@ The four skills (`code-audit`, `harness-audit`, `notion-task-pages`, `plain-pros
 /plugin install session-toolkit --marketplace mkhinini-motaz/claude-code-session-toolkit
 ```
 
+[`directory/`](directory/) is a code-free copy (two skills and the worker agent) for Anthropic's plugin directory.
+
 The other command-line tools and hooks install with `install.sh`. Clone the repo, then install the tools you want. Each folder's README says what it needs.
 
     ./install.sh --list                     # the tools

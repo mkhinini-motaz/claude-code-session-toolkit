@@ -11,5 +11,6 @@ Small, separate tools for Claude Code, one folder per tool. Tools share no code;
   - Status line: `echo '{"model":{"display_name":"Test"}}' | SL_STATE=$(mktemp -d) bash status-line/statusline-command.sh`; without `SL_STATE` it writes to `~/.claude/statusline-usage`.
   - `reminders`, `emu` (apart from `ui.py self-test`) and `check-16kb` have no self-test: see their READMEs.
 - The main thread's state file is `<scratchpad>/state.md`, a worker's is `<scratchpad>/<task>/state.md`; `compact-restore` never hands one to the other, and `worker-agent/worker.md` says the same.
+- `directory/` is a code-free copy for the plugin directory: edit the originals (two skills, `worker-agent/worker.md`, `LICENSE`, the icon), copy them to `directory/`; CI checks they match and that only allowed file types are there. Check it with `claude plugin validate directory`.
 - CI: `.github/workflows/tests.yml` runs the list above on macOS with a scratch `HOME`.
 - The skills in `skills/code-audit/`, `skills/harness-audit/`, `skills/notion-task-pages/` and `skills/plain-prose/` also ship as one plugin (`.claude-plugin/`), together with the `worker` agent. Check it after a change: `claude plugin validate .`

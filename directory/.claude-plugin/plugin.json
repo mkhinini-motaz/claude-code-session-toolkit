@@ -1,0 +1,23 @@
+{
+  "name": "session-toolkit",
+  "version": "0.3.1",
+  "description": "Two skills (Notion task pages, plain prose) and a worker agent for Claude Code. The full toolkit, with the audit skills and the command-line tools, installs from the repo's own marketplace.",
+  "author": {
+    "name": "mkhinini-motaz",
+    "url": "https://github.com/mkhinini-motaz"
+  },
+  "homepage": "https://github.com/mkhinini-motaz/claude-code-session-toolkit",
+  "repository": "https://github.com/mkhinini-motaz/claude-code-session-toolkit",
+  "license": "MIT",
+  "icon": "./.claude-plugin/icon.png",
+  "keywords": [
+    "claude-code",
+    "agent-skills",
+    "notion",
+    "writing",
+    "developer-tools"
+  ],
+  "agents": [
+    "./agents/worker.md"
+  ]
+}

@@ -33,6 +33,8 @@ Format: https://agentskills.io/specification. `.github/check-skills.py` checks i
 
 When you change anything a skill or the agent, raise `version` in both `.claude-plugin/plugin.json` and `plugin.json`; `check-skills.py` fails when they differ. Installed copies update only when the version rises.
 
+The code-free plugin in `directory/` holds copies of two skills, the worker agent, the licence and the icon: edit the originals, copy them to `directory/`, and CI fails if they differ. `directory/.claude-plugin/plugin.json` takes the same version.
+
 ## Pull request process
 
 - Open the "New tool" issue form first for new work, so two people do not start the same thing.

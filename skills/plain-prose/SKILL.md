@@ -25,10 +25,12 @@ Chat replies are out of scope: this is for text that persists.
 
 ## Check
 
-After writing or editing the file, run:
+After writing or editing the file, check it. If `check.py` sits next to this file, run:
 
 ```
 ${CLAUDE_SKILL_DIR}/check.py <file>...
 ```
 
 It prints `file:line: phrase: reason` for each tell outside code, and exits 1 if it finds any. Rewrite each hit, or keep it when it is the plainest way to say the thing (a quoted title, a term of art). The script finds words, not meaning: rules 2, 3, 7, 9, 10 and 11 still need a read-through. `check.py self-test` proves the patterns.
+
+If `check.py` is not there, re-read the file against the rules above, line by line.

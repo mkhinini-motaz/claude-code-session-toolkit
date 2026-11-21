@@ -5,7 +5,7 @@ Usage: check-skills.py SKILL.md_or_folder ... [--agents FILE ...]
 Skills: name is 1-64 chars of a-z, 0-9, single hyphens, and equals the folder name;
 description is 1-1024 chars; the file is at most 500 lines.
 --agents: each file needs a non-empty description, and name equals the file name.
-Also: when both plugin.json (Agent Plugins) and .claude-plugin/plugin.json exist, their versions must match.
+Also: when both plugin.json (Agent Plugins) and .claude-plugin/plugin.json exist, their versions (and directory/.claude-plugin/plugin.json) must match.
 Stdlib only. Exit 1 on any failure.
 """
 import json
@@ -64,13 +64,15 @@ def check_agent(path):
 
 def check_versions(root):
     a, b = root / "plugin.json", root / ".claude-plugin" / "plugin.json"
+    d = root / "directory" / ".claude-plugin" / "plugin.json"
     if not (a.is_file() and b.is_file()):
         return 0
-    va, vb = (json.loads(f.read_text(encoding="utf-8")).get("version") for f in (a, b))
-    if va != vb:
-        print(f"FAIL plugin.json version {va!r} differs from .claude-plugin/plugin.json {vb!r}")
+    fs = [f for f in (a, b, d) if f.is_file()]
+    vs = [json.loads(f.read_text(encoding="utf-8")).get("version") for f in fs]
+    if len(set(vs)) > 1:
+        print(f"FAIL plugin.json versions differ: {dict(zip(map(str, fs), vs))}")
         return 1
-    print(f"ok   plugin.json versions match ({va})")
+    print(f"ok   plugin.json versions match ({vs[0]}, {len(fs)} files)")
     return 0
 
 

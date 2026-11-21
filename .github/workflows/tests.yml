@@ -7,6 +7,16 @@ jobs:
       - uses: actions/checkout@v7
       - name: Check skill files
         run: python3 .github/check-skills.py skills/*
+      - name: Directory copy matches the originals and holds only allowed files
+        run: |
+          diff skills/notion-task-pages/SKILL.md directory/skills/notion-task-pages/SKILL.md
+          diff skills/plain-prose/SKILL.md directory/skills/plain-prose/SKILL.md
+          diff worker-agent/worker.md directory/agents/worker.md
+          diff LICENSE directory/LICENSE
+          diff .claude-plugin/icon.png directory/.claude-plugin/icon.png
+          bad=$(git ls-files directory | grep -viE '\.(md|txt|json|ya?ml|png|jpe?g|gif|webp|ico)$|(^|/)(LICENSE|\.gitignore)$' || true)
+          test -z "$bad" || { echo "$bad"; exit 1; }
+          ! grep -rl '^#!' directory
       - name: Self-tests (the list in AGENTS.md), with a scratch HOME
         shell: bash
         run: |
