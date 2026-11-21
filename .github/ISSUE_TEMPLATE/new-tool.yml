@@ -1,0 +1,38 @@
+name: New tool
+description: Propose a new tool, one folder with no shared code.
+title: "New tool: "
+labels: ["enhancement"]
+body:
+  - type: input
+    id: name
+    attributes:
+      label: Folder name
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What does it do, and what problem does it solve?
+    validations:
+      required: true
+  - type: dropdown
+    id: kind
+    attributes:
+      label: What does it install?
+      options:
+        - A command in bin
+        - A hook
+        - A skill or agent
+        - Something else
+    validations:
+      required: true
+  - type: textarea
+    id: test
+    attributes:
+      label: How will the self-test run without touching a real ~/.claude?
+  - type: checkboxes
+    id: claim
+    attributes:
+      label: Do you want to write it?
+      options:
+        - label: Yes, I will open the pull request.

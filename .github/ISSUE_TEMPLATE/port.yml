@@ -1,0 +1,34 @@
+name: Port
+description: Port a tool to Linux or Windows, or claim a port so nobody else starts it.
+title: "Port: "
+labels: ["enhancement"]
+body:
+  - type: input
+    id: tool
+    attributes:
+      label: Tool
+      description: The folder name, for example `status-line`.
+    validations:
+      required: true
+  - type: dropdown
+    id: target
+    attributes:
+      label: Target
+      options:
+        - Linux
+        - Windows
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What is macOS-only today?
+      description: For example BSD stat, sips, the keychain, or a /private/tmp path. Name the file and line if you know it.
+    validations:
+      required: true
+  - type: checkboxes
+    id: claim
+    attributes:
+      label: Do you want to write it?
+      options:
+        - label: Yes, I will open the pull request, and macOS will keep working.

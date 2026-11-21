@@ -47,6 +47,10 @@ The other command-line tools and hooks install with `install.sh`. Clone the repo
 - Everything reads local files (your transcripts, settings and repos), except `notion`, `apify` and `browse`, which call the services they are named for (`browse` also runs `npm install` of `playwright-core` on first use, then loads whatever page you give it).
 - Most scripts assume macOS paths (`/private/tmp/claude-<uid>/...` scratchpads, BSD `stat`, `sips`, the keychain `security`). Linux may need small changes; the tools that need macOS say so under Requirements.
 
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md). Issues labelled [`good first issue`](https://github.com/mkhinini-motaz/claude-code-toolkit/labels/good%20first%20issue) are a good place to start. A Linux port of a macOS-only tool is welcome.
+
 ## Credits
 
 `plain-prose` is adapted from [`stop-slop`](https://github.com/hardikpandya/stop-slop) by Hardik Pandya (MIT, copyright 2025 Hardik Pandya); the licence text is in `plain-prose/NOTICE`.
