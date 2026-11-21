@@ -282,7 +282,7 @@ def hook(over):
         hits = glob.glob(f'/private/tmp/claude-*/*/{sid}/scratchpad/[sS][tT][aA][tT][eE].md')
         st = (f' State file last written {int((time.time() - max(map(os.path.getmtime, hits))) // 60)} min ago.' if hits else
               f' No state file yet: write /private/tmp/claude-{os.getuid()}/{slug}/{sid}/scratchpad/state.md')
-    note = (' Auto-compaction is near: keep the scratchpad state file (done, decisions, next, files touched) '
+    note = (' Auto-compaction is near: keep the scratchpad state file (done, decisions, next, what failed and why, files touched) '
             'current so it loses nothing.' + st) if ctx >= over * 1000 else ''
     print(f'Context: {ctx // 1000}k tokens.{note}' + (f' {tips}' if tips else ''))
 

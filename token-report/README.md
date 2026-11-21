@@ -22,7 +22,7 @@ Input tokens are everything a call reads: fresh input plus cache reads and cache
 
 ## Hook (optional)
 
-`token-report hook` prints the context size on every prompt. Past K thousand tokens (default 300) it reminds Claude to keep a scratchpad state file current before auto-compaction. It also adds a short nudge for a prompt with a very large paste, a key-shaped string, a "do it all" request, or a long session that changes topic. It never blocks. Add to `~/.claude/settings.json`:
+`token-report hook` prints the context size on every prompt. Past K thousand tokens (default 300) it reminds Claude to keep a scratchpad state file current (done, decisions, next, what failed and why, files touched) before auto-compaction. It also adds a short nudge for a prompt with a very large paste, a key-shaped string, a "do it all" request, or a long session that changes topic. It never blocks. Add to `~/.claude/settings.json`:
 
     { "hooks": { "UserPromptSubmit": [ { "hooks": [ { "type": "command", "command": "~/.claude/bin/token-report hook" } ] } ] } }
 

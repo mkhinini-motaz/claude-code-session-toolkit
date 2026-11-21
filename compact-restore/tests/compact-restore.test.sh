@@ -18,7 +18,7 @@ run(){ echo "{\"session_id\":\"$SID\",\"transcript_path\":\"$TR\",\"cwd\":\"/tmp
 fail=0; chk(){ echo "$OUT" | grep -qF -- "$1" || { echo "FAIL: missing '$1'"; fail=1; }; }
 nochk(){ echo "$OUT" | grep -qF -- "$1" && { echo "FAIL: unexpected '$1'"; fail=1; }; }
 OUT=$(run)
-chk "No state file survived compaction. Write $SP/state.md"; chk "/x/b.php"; chk "git commit --only a"
+chk "No state file survived compaction. Write $SP/state.md"; chk "/x/b.php"; chk "git commit --only a"; chk "each approach that failed with why"
 chk "via tool"; chk "second typed prompt"; chk "third typed prompt"; nochk "first typed prompt"; nochk "skip me"
 [ "$(echo "$OUT" | grep -c '/x/a.php')" = 1 ] || { echo "FAIL: a.php not deduped"; fail=1; }
 echo "DONE-ITEM-42" > $SP/State.md

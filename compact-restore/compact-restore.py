@@ -83,7 +83,7 @@ def main():
     if not path and not sub:
         exp = f'{scratch or f"/private/tmp/claude-{os.getuid()}/{slug}/{sid}/scratchpad"}/state.md'
         out.append(f'\nNo state file survived compaction. Write {exp} now from the summary and the list above, marking each '
-                   'open item run / read / assumed, and check each against `git status` before acting on it.')
+                   'open item run / read / assumed and each approach that failed with why, and check each against `git status` before acting on it.')
     print('\n'.join(out)[:CAP])
 
 
