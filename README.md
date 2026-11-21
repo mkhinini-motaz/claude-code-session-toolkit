@@ -41,6 +41,10 @@ The other command-line tools and hooks install with `install.sh`. Clone the repo
 
 `install.sh` copies a tool's files into `~/.claude/bin`, `~/.claude/hooks`, `~/.claude/agents`, `~/.claude/emu`, `~/.claude/skills/<name>` or, for the status line, `~/.claude/statusline-command.sh`. It refuses to overwrite an existing file and never edits `settings.json`: for a hook it prints the snippet to merge in by hand. Set `CLAUDE_HOME` to install somewhere other than `~/.claude`.
 
+## Use with other agents
+
+The four skills are `SKILL.md` folders, a format Codex, Cursor, GitHub Copilot, Gemini CLI and OpenCode also load. All five read a project's `.agents/skills/` folder, so copying a skill folder there should work. The command-line tools and hooks are for Claude Code and are not portable. I have only tested the skills in Claude Code.
+
 ## Notes
 
 - The tools were built with Claude Code.

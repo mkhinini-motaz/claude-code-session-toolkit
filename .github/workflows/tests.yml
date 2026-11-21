@@ -5,6 +5,8 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Check skill files
+        run: python3 .github/check-skills.py code-audit harness-audit notion-task-pages plain-prose
       - name: Self-tests (the list in AGENTS.md), with a scratch HOME
         shell: bash
         run: |
