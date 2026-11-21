@@ -4,6 +4,11 @@ W="$(cd "$(dirname "$0")/.." && pwd)/agent-watch"
 export AGENT_WATCH_POLL=1
 T=$(mktemp -d)
 fail=0
+# macOS has no `timeout` unless coreutils is installed: a perl stand-in that also exits 124
+command -v timeout >/dev/null || timeout() {
+  perl -e '$s = shift; $p = fork // die; if (!$p) { exec @ARGV or exit 127 }
+    $SIG{ALRM} = sub { kill "TERM", $p; exit 124 }; alarm $s; waitpid $p, 0; exit($? >> 8)' "$@"
+}
 ago() { touch -t "$(date -v-"$2"M +%Y%m%d%H%M.%S)" "$1"; }
 agent() { # dir id finished(true|null) minutes-ago
   mkdir -p "$1"
