@@ -4,7 +4,7 @@ A small, code-free part of the session toolkit for Claude Code. It holds two ski
 
 - `notion-task-pages`: section order and writing rules for a Notion task page.
 - `plain-prose`: rules that strip AI-writing tells from docs, notes and READMEs. Without its checker script, it has Claude re-read the file against the rules.
-- `worker`: an agent for build, fix and audit work that edits code or runs long. It compacts earlier and drops the tools a worker does not need.
+- `worker`: an agent for build, fix and audit work that edits code or runs long. It runs on Sonnet and has only the file, shell, web and skill tools.
 
 ## Where it works
 

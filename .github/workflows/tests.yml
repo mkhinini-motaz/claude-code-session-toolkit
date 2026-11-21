@@ -11,7 +11,7 @@ jobs:
         run: |
           diff skills/notion-task-pages/SKILL.md directory/skills/notion-task-pages/SKILL.md
           diff skills/plain-prose/SKILL.md directory/skills/plain-prose/SKILL.md
-          diff worker-agent/worker.md directory/agents/worker.md
+          diff <(sed '1,/^---$/d' worker-agent/worker.md) <(sed '1,/^---$/d' directory/agents/worker.md)  # same body; the directory copy uses only accepted front matter keys
           diff LICENSE directory/LICENSE
           diff .claude-plugin/icon.png directory/.claude-plugin/icon.png
           bad=$(git ls-files directory | grep -viE '\.(md|txt|json|ya?ml|png|jpe?g|gif|webp|ico)$|(^|/)(LICENSE|\.gitignore)$' || true)

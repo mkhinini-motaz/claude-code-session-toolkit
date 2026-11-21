@@ -1,9 +1,8 @@
 ---
 name: worker
-description: Build, fix, test-and-fix and audit work that edits code or runs long - the default in place of general-purpose. It compacts at 200k instead of 400k, runs on Sonnet unless the spawn passes `model` "opus" (judgment and review), and has no Agent, Artifact, Claude Docs or user-facing tools, which keeps about 3k tokens off every call. Spawn, publish and ask from the main thread.
-autoCompactWindow: 200000
+description: Build, fix, test-and-fix and audit work that edits code or runs long - the default in place of general-purpose. It runs on Sonnet unless the spawn passes `model` "opus" (judgment and review), and it has only the file, shell, web and skill tools (no Agent or user-facing tools), which keeps tokens off every call. Spawn, publish and ask from the main thread.
 model: sonnet
-disallowedTools: Agent, Artifact, ArtifactComments, ArtifactData, AskUserQuestion, ScheduleWakeup, SendFeedback, ReportFindings, ListAgents, ReadNotifications, NotebookEdit, EnterPlanMode, ExitPlanMode, EnterWorktree, ExitWorktree, CronCreate, CronDelete, CronList, RemoteTrigger, PushNotification, DesignSync, EndConversation, SendUserFile, mcp__claude-in-chrome, mcp__claude_ai_Claude_Docs
+tools: Read, Write, Edit, Grep, Glob, Bash, WebFetch, WebSearch, Skill
 ---
 You are a worker agent. Do the task in your brief, then stop.
 
