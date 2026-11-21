@@ -10,9 +10,9 @@ Small tools from a daily Claude Code setup, copied out as one repo with one fold
 | [`reap-dev-servers/`](reap-dev-servers/) | Stops Metro, `next dev` and jest processes that sessions left running, at session start. |
 | [`agent-watch/`](agent-watch/) | Wakes the main thread when a background subagent is stuck. A script, a hook and a test. |
 | [`compact-restore/`](compact-restore/) | After compaction, restores the scratchpad state file, edited files, commits and your last prompts. |
-| [`code-audit/`](code-audit/) | A read-only repo audit skill with a brief template, five stack guides and ten helper scripts. |
-| [`harness-audit/`](harness-audit/) | Audits how you work with Claude Code from local session history; read-only; ends with a ranked report. |
-| [`plain-prose/`](plain-prose/) | A skill and checker that remove AI-writing tells from docs and reports. |
+| [`skills/code-audit/`](skills/code-audit/) | A read-only repo audit skill with a brief template, five stack guides and ten helper scripts. |
+| [`skills/harness-audit/`](skills/harness-audit/) | Audits how you work with Claude Code from local session history; read-only; ends with a ranked report. |
+| [`skills/plain-prose/`](skills/plain-prose/) | A skill and checker that remove AI-writing tells from docs and reports. |
 | [`notion/`](notion/) | Reads and edits Notion pages over the REST API in compact Markdown, one section at a time, instead of fetching whole pages through the MCP connector. |
 | [`img-shrink/`](img-shrink/) | A Read hook that shows Claude large screenshots shrunk to 1200 px, with `img-full` for the original. macOS only. |
 | [`browse/`](browse/) | A scripted headless Chrome walk: one Bash call runs a whole web check instead of 10 to 20 Playwright MCP calls. |
@@ -20,7 +20,7 @@ Small tools from a daily Claude Code setup, copied out as one repo with one fold
 | [`status-line/`](status-line/) | A Claude Code status line: model, context against the compact window, session time, cost, 5h and 7d plan limits with pace, git state, running subagents. `statusline-price-fit` re-measures its subagent prices. |
 | [`agent-cost-line/`](agent-cost-line/) | A hook that warns with an estimated token total when one prompt starts its 3rd, 5th, 10th, 15th and 20th subagent. |
 | [`worker-agent/`](worker-agent/) | A subagent definition for build and fix work: Sonnet by default, compacts at 200k, trimmed tool list, short working rules. |
-| [`notion-task-pages/`](notion-task-pages/) | A skill with the section order and writing rules for a Notion task page. Pairs with `notion/`. |
+| [`skills/notion-task-pages/`](skills/notion-task-pages/) | A skill with the section order and writing rules for a Notion task page. Pairs with `notion/`. |
 | [`reminders/`](reminders/) | A SessionStart hook that shows dated reminders from a TSV file, per folder. |
 | [`commit/`](commit/) | A path-scoped `git commit` for shared trees: stages only the paths you name, adds the Claude trailers, and checks the committed files. |
 | [`emu/`](emu/) | Drives the Android emulator from the shell: dump the screen, tap by label, wait, screenshot, GPS and demo status bar, plus a React Native debugger driver. |
@@ -45,6 +45,8 @@ The other command-line tools and hooks install with `install.sh`. Clone the repo
 
 The four skills are `SKILL.md` folders, a format Codex, Cursor, GitHub Copilot, Gemini CLI and OpenCode also load. All five read a project's `.agents/skills/` folder, so copying a skill folder there should work. The command-line tools and hooks are for Claude Code and are not portable. I have only tested the skills in Claude Code.
 
+The root `plugin.json` follows the [Agent Plugins](https://github.com/agentplugins/agent-plugins-spec/blob/main/spec/1.1.0.md) standard (1.1.0), so clients that load it can install this as a plugin. The list at https://agent-plugins.org/compatible-clients names Cursor, GitHub Copilot, ChatGPT & Codex, Kiro, Hermes Agent, OpenClaw, Grok Bot, NanoClaw, OpenHands, Perplexity Computer and Google Antigravity. I have not tested it in any of them, since none is installed here. Claude Code keeps using `.claude-plugin/`.
+
 ## Notes
 
 - The tools were built with Claude Code.
@@ -57,7 +59,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md). Issues labelled [`good first issue`](htt
 
 ## Credits
 
-`plain-prose` is adapted from [`stop-slop`](https://github.com/hardikpandya/stop-slop) by Hardik Pandya (MIT, copyright 2025 Hardik Pandya); the licence text is in `plain-prose/NOTICE`.
+`plain-prose` is adapted from [`stop-slop`](https://github.com/hardikpandya/stop-slop) by Hardik Pandya (MIT, copyright 2025 Hardik Pandya); the licence text is in `skills/plain-prose/NOTICE`.
 
 ## Licence
 

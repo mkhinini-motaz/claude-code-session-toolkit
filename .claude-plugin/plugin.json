@@ -1,6 +1,6 @@
 {
   "name": "session-toolkit",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Claude Code session tools: four skills (code audit, harness audit, Notion task pages, plain prose) and a worker agent. The other CLI tools and hooks install with install.sh.",
   "author": {
     "name": "mkhinini-motaz",
@@ -18,12 +18,6 @@
     "code-audit",
     "agent-skills",
     "developer-tools"
-  ],
-  "skills": [
-    "./code-audit",
-    "./harness-audit",
-    "./notion-task-pages",
-    "./plain-prose"
   ],
   "agents": [
     "./worker-agent/worker.md"

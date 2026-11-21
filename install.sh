@@ -35,8 +35,8 @@ files() {
     check-16kb)       echo "check-16kb/check-16kb|bin/check-16kb" ;;
     emu)              for f in emu ui.py demo.sh gps.sh storelang.sh rn.mjs; do echo "emu/$f|emu/$f"; done ;;
     code-audit|plain-prose|harness-audit|notion-task-pages)
-      find "$1" -type f ! -name .DS_Store ! -name README.md ! -name '*.pyc' ! -path '*/__pycache__/*' ! -path '*/tests/*' | sort |
-        while read -r f; do echo "$f|skills/$f"; done ;;
+      find "skills/$1" -type f ! -name .DS_Store ! -name README.md ! -name '*.pyc' ! -path '*/__pycache__/*' ! -path '*/tests/*' | sort |
+        while read -r f; do echo "$f|$f"; done ;;
     *) return 1 ;;
   esac
 }
@@ -60,10 +60,10 @@ snippet() {
 DRY=0; WANT=()
 for a in "$@"; do
   case "$a" in
-    --list) for t in $TOOLS; do [ -e "$t" ] && echo "$t"; done; exit 0 ;;
+    --list) for t in $TOOLS; do { [ -e "$t" ] || [ -e "skills/$t" ]; } && echo "$t"; done; exit 0 ;;
     --dry-run) DRY=1 ;;
     -*) echo "unknown option: $a"; exit 2 ;;
-    *) files "$a" >/dev/null 2>&1 && [ -e "$a" ] || { echo "unknown tool: $a (see --list)"; exit 2; }; WANT+=("$a") ;;
+    *) files "$a" >/dev/null 2>&1 && { [ -e "$a" ] || [ -e "skills/$a" ]; } || { echo "unknown tool: $a (see --list)"; exit 2; }; WANT+=("$a") ;;
   esac
 done
 [ ${#WANT[@]} -gt 0 ] || { echo "name at least one tool (see --list)"; exit 2; }

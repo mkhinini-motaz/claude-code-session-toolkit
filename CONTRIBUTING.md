@@ -31,7 +31,7 @@ Format: https://agentskills.io/specification. `.github/check-skills.py` checks i
 
 ## Bump the version
 
-When you change anything a skill or the agent, raise `version` in `.claude-plugin/plugin.json`. Installed copies update only when the version rises.
+When you change anything a skill or the agent, raise `version` in both `.claude-plugin/plugin.json` and `plugin.json`; `check-skills.py` fails when they differ. Installed copies update only when the version rises.
 
 ## Pull request process
 
@@ -57,7 +57,7 @@ sh bg/bg --self-test
 bash tests/install.test.sh
 bash status-line/tests/price-fit.test.sh
 claude plugin validate .
-python3 .github/check-skills.py code-audit harness-audit notion-task-pages plain-prose
+python3 .github/check-skills.py skills/*
 ```
 
 Then each tool's own self-test. The full list is in `AGENTS.md`, and the same list runs in CI (`.github/workflows/tests.yml`).

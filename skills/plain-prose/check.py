@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Flags AI-prose tells in text files: plain-prose/check.py FILE... (exit 1 when anything is found).
+"""Flags AI-prose tells in text files: skills/plain-prose/check.py FILE... (exit 1 when anything is found).
 
 A paragraph over 80 words or a bullet over 35 is a length warning: printed, never counted in the exit code
 (do not run it in a hook or pre-commit: a hit there would block a commit over style).

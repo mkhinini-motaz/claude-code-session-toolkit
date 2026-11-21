@@ -6,7 +6,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Check skill files
-        run: python3 .github/check-skills.py code-audit harness-audit notion-task-pages plain-prose
+        run: python3 .github/check-skills.py skills/*
       - name: Self-tests (the list in AGENTS.md), with a scratch HOME
         shell: bash
         run: |
@@ -19,8 +19,8 @@ jobs:
           bash tests/install.test.sh
           bash status-line/tests/price-fit.test.sh
           for t in notion/notion notion/notion-push img-shrink/img-shrink.py apify/apify agent-cost-line/agent-cost-line.py commit/commit token-report/subagent-cost; do python3 $t --self-test; done
-          for t in notes/notes token-report/token-report reap-dev-servers/reap-dev-servers plain-prose/check.py; do python3 $t self-test; done
-          python3 -I harness-audit/scripts/collect.py selftest
+          for t in notes/notes token-report/token-report reap-dev-servers/reap-dev-servers skills/plain-prose/check.py; do python3 $t self-test; done
+          python3 -I skills/harness-audit/scripts/collect.py selftest
           python3 emu/ui.py self-test
           node browse/browse --self-test
           echo '{"model":{"display_name":"Test"}}' | bash status-line/statusline-command.sh
