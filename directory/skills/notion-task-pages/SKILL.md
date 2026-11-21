@@ -5,7 +5,7 @@ description: Section order and writing rules for a Notion task page in any proje
 
 # Notion task pages
 
-Rules for the body of one task page. Where the database, IDs and write calls live depends on the project: keep them in that project's own notes. Read and write pages with the toolkit's `notion` command line (`~/.claude/bin/notion`: get, put, add, edit, set, new, query, search).
+Rules for the body of one task page. Where the database, IDs and write calls live depends on the project: keep them in that project's own notes. Read and write pages with the Notion tools you have: a Notion connector, or the full toolkit's `notion` command line (get, put, add, edit, set, new, query, search). With neither, write the page body as Markdown for the user to paste.
 
 ## Order of sections
 
