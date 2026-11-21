@@ -1,4 +1,4 @@
-# claude-code-toolkit
+# claude-code-session-toolkit
 
 Small tools from a daily Claude Code setup, copied out as one repo with one folder per tool. They cover what tokens cost (`token-report`), docs discipline (`notes`), session hygiene (`bg`, `reap-dev-servers`, `agent-watch`, `compact-restore`), audits and prose (`code-audit`, `harness-audit`, `plain-prose`), Notion from the command line (`notion`), smaller screenshots (`img-shrink`), scripted browser checks (`browse`), Apify from the command line (`apify`), a status line (`status-line`), Android emulator and build checks (`emu`, `check-16kb`) and small helpers (`commit`, `reminders`, `agent-cost-line`, `worker-agent`). Each tool installs on its own.
 
@@ -30,7 +30,7 @@ Small tools from a daily Claude Code setup, copied out as one repo with one fold
 The four skills (`code-audit`, `harness-audit`, `notion-task-pages`, `plain-prose`) and the `worker` agent install as one Claude Code plugin, inside a session (Claude Code 2.1.275 or later):
 
 ```
-/plugin install session-toolkit --marketplace mkhinini-motaz/claude-code-toolkit
+/plugin install session-toolkit --marketplace mkhinini-motaz/claude-code-session-toolkit
 ```
 
 The other command-line tools and hooks install with `install.sh`. Clone the repo, then install the tools you want. Each folder's README says what it needs.
@@ -49,7 +49,7 @@ The other command-line tools and hooks install with `install.sh`. Clone the repo
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). Issues labelled [`good first issue`](https://github.com/mkhinini-motaz/claude-code-toolkit/labels/good%20first%20issue) are a good place to start. A Linux port of a macOS-only tool is welcome.
+See [CONTRIBUTING.md](CONTRIBUTING.md). Issues labelled [`good first issue`](https://github.com/mkhinini-motaz/claude-code-session-toolkit/labels/good%20first%20issue) are a good place to start. A Linux port of a macOS-only tool is welcome.
 
 ## Credits
 
