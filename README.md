@@ -66,15 +66,7 @@ I measure each change to my setup on my session transcripts. A few results:
 
 ## Where they plug in
 
-```mermaid
-flowchart LR
-  SS["Session start"] --> RD["reap-dev-servers<br/>reminders<br/>compact-restore (after a compaction)"]
-  UP["Each prompt"] --> TR["token-report hook (context size)<br/>agent-cost-line"]
-  PT["Before a tool call"] --> PRE["agent-cost-line (Agent)<br/>img-shrink (Read)"]
-  PO["After a tool call"] --> POST["agent-watch (after a spawn)<br/>notes (after Edit or Write)<br/>img-shrink"]
-  SL["Status line"] --> STL["status-line"]
-  CLI["From the shell or a Bash call"] --> TOOLS["token-report, subagent-cost, bg, commit,<br/>notion, apify, browse, emu, check-16kb"]
-```
+<picture><source media="(prefers-color-scheme: dark)" srcset="docs/diagrams/hooks-dark.svg"><img src="docs/diagrams/hooks.svg" alt="Diagram of where the tools plug in: session start, each prompt, before and after a tool call, the status line and the shell."></picture>
 
 ## Install
 The four skills (`code-audit`, `harness-audit`, `notion-task-pages`, `plain-prose`) and the `worker` agent install as one Claude Code plugin, inside a session (Claude Code 2.1.275 or later):

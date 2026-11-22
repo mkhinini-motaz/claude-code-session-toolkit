@@ -1,0 +1,7 @@
+flowchart LR
+  SS["Session start"] --> RD["reap-dev-servers<br/>reminders<br/>compact-restore (after a compaction)"]
+  UP["Each prompt"] --> TR["token-report hook (context size)<br/>agent-cost-line"]
+  PT["Before a tool call"] --> PRE["agent-cost-line (Agent)<br/>img-shrink (Read)"]
+  PO["After a tool call"] --> POST["agent-watch (after a spawn)<br/>notes (after Edit or Write)<br/>img-shrink"]
+  SL["Status line"] --> STL["status-line"]
+  CLI["From the shell or a Bash call"] --> TOOLS["token-report, subagent-cost, bg, commit,<br/>notion, apify, browse, emu, check-16kb"]
